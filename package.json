@@ -1,7 +1,7 @@
 {
   "name": "dxf-renderer",
   "version": "0.0.0-development",
-  "description": "TypeScript DXF file viewer and renderer",
+  "description": "TypeScript DXF file renderer",
   "license": "MPL-2.0",
   "type": "module",
   "keywords": [
