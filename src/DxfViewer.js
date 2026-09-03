@@ -5,6 +5,7 @@ import {MaterialKey} from "./MaterialKey.js"
 import {ColorCode, DxfScene} from "./DxfScene.js"
 import {OrbitControls} from "./OrbitControls.js"
 import {RBTree} from "./RBTree.js"
+import {convertEmfToDataUrl} from "emf-converter"
 
 
 /** Level in "message" events. */
@@ -13,6 +14,21 @@ const MessageLevel = Object.freeze({
     WARN: "warn",
     ERROR: "error"
 })
+
+/* TextureLoader uploads HTML/Canvas images with flipY enabled. Normal IMAGE entities use
+ * lower-left DXF insertion points, while OLE2FRAME stores its first corner as upper-left. */
+const IMAGE_QUAD_UVS = [
+    0, 0,
+    1, 0,
+    1, 1,
+    0, 1
+]
+const OLE_FRAME_QUAD_UVS = [
+    0, 1,
+    1, 1,
+    1, 0,
+    0, 0
+]
 
 
 /** The representation class for the viewer, based on Three.js WebGL renderer. */
@@ -34,6 +50,15 @@ export class DxfViewer {
         this.clearColor = this.options.clearColor.getHex()
 
         this.scene = new three.Scene()
+        this.modelScene = null
+        this.modelOrigin = null
+        this.modelBlocks = new Map()
+        this.viewports = []
+        this.imageResources = []
+        this.imageTexturePromises = new Map()
+        this.missingImagePaths = new Set()
+        this.viewportCamera = new three.OrthographicCamera(-1, 1, 1, -1, 0.1, 2)
+        this.viewportCamera.position.z = 1
 
        this.ownsRenderer = !options.renderer
        this.renderer = options.renderer
@@ -165,9 +190,9 @@ export class DxfViewer {
 
     /** Load DXF into the viewer. Old content is discarded, state is reset.
      * @param {string} url DXF file URL.
-     * @param {?string[]} fonts List of font URLs. Files should have typeface.js format. Fonts are
-     *  used in the specified order, each one is checked until necessary glyph is found. Text is not
-     *  rendered if fonts are not specified.
+     * @param {?(string|{url:string,names:?string[]})[]} fonts List of font URLs or named font
+     *  sources. A named source is selected when a DXF STYLE references one of its names; remaining
+     *  sources are used as glyph fallbacks. Text is not rendered if fonts are not specified.
      * @param {?Function} progressCbk (phase, processedSize, totalSize)
      *  Possible phase values:
      *  * "font"
@@ -177,10 +202,12 @@ export class DxfViewer {
      * @param {?Function} workerFactory Factory for worker creation. The worker script should
      *  invoke DxfViewer.SetupWorker() function.
      */
-    async Load({url, fonts = null, progressCbk = null, workerFactory = null}) {
+    async Load({url, fonts = null, images = null, progressCbk = null, workerFactory = null}) {
         if (url === null || url === undefined) {
             throw new Error("`url` parameter is not specified")
         }
+
+        this.lastLoadParams = { url, fonts, images, progressCbk, workerFactory }
 
         this._EnsureRenderer()
 
@@ -195,39 +222,33 @@ export class DxfViewer {
         this.origin = scene.origin
         this.bounds = scene.bounds
         this.hasMissingChars = scene.hasMissingChars
+        this.layouts = scene.layouts || []
+        this.imageDefs = scene.imageDefs || {}
+        this.activeLayout = scene.activeLayout || (this.layouts.find(l => !l.isModel)?.name ?? "Model")
+        this.viewports = scene.viewports || []
 
-        for (const layer of scene.layers) {
-            this.layers.set(layer.name, new Layer(layer.name, layer.displayName, layer.color))
+        for (const layer of [...scene.layers, ...(scene.modelScene?.layers || [])]) {
+            if (!this.layers.has(layer.name)) {
+                this.layers.set(layer.name, new Layer(layer.name, layer.displayName, layer.color))
+            }
         }
         this.defaultLayer = this.layers.get("0") ?? new Layer("0", "0", 0)
 
-        /* Load all blocks on the first pass. */
-        for (const batch of scene.batches) {
-            if (batch.key.blockName !== null &&
-                batch.key.geometryType !== BatchingKey.GeometryType.BLOCK_INSTANCE &&
-                batch.key.geometryType !== BatchingKey.GeometryType.POINT_INSTANCE) {
-
-                let block = this.blocks.get(batch.key.blockName)
-                if (!block) {
-                    block = new Block()
-                    this.blocks.set(batch.key.blockName, block)
-                }
-                block.PushBatch(new Batch(this, scene, batch))
-            }
+        this.blocks = this._LoadSceneGraph(scene, this.scene)
+        await this._LoadImages(scene, this.scene, images)
+        await this._LoadOleFrames(scene, this.scene)
+        if (scene.modelScene) {
+            this.modelScene = new three.Scene()
+            this.modelOrigin = scene.modelScene.origin
+            this.modelBlocks = this._LoadSceneGraph(scene.modelScene, this.modelScene)
+            await this._LoadImages(scene.modelScene, this.modelScene, images)
+            await this._LoadOleFrames(scene.modelScene, this.modelScene)
         }
 
         console.log(`DXF scene:
-                     ${scene.batches.length} batches,
+                     ${scene.batches.length + (scene.modelScene?.batches.length || 0)} batches,
                      ${this.layers.size} layers,
-                     ${this.blocks.size} blocks,
-                     vertices ${scene.vertices.byteLength} B,
-                     indices ${scene.indices.byteLength} B
-                     transforms ${scene.transforms.byteLength} B`)
-
-        /* Instantiate all entities. */
-        for (const batch of scene.batches) {
-            this._LoadBatch(scene, batch)
-        }
+                     ${this.blocks.size + this.modelBlocks.size} blocks`)
 
         this._Emit("loaded")
 
@@ -249,7 +270,60 @@ export class DxfViewer {
 
     Render() {
         this._EnsureRenderer()
-        this.renderer.render(this.scene, this.camera)
+        if (!this.modelScene || this.viewports.length === 0 || !this.modelOrigin || !this.origin) {
+            this.renderer.render(this.scene, this.camera)
+            return
+        }
+
+        const renderer = this.renderer
+        const previousAutoClear = renderer.autoClear
+        renderer.autoClear = false
+        renderer.setScissorTest(false)
+        renderer.setViewport(0, 0, this.canvasWidth, this.canvasHeight)
+        renderer.clear(true, true, true)
+
+        for (const viewport of this.viewports) {
+            this._RenderViewport(viewport)
+        }
+
+        renderer.setScissorTest(false)
+        renderer.setViewport(0, 0, this.canvasWidth, this.canvasHeight)
+        renderer.clearDepth()
+        renderer.render(this.scene, this.camera)
+        renderer.autoClear = previousAutoClear
+    }
+
+    /** @return {Iterable<{id: string, name: string, tabOrder: number, isModel: boolean, isActive: boolean}>} List of layout descriptors. */
+    GetLayouts() {
+        return (this.layouts || []).map(l => ({
+            id: l.name,
+            name: l.name,
+            tabOrder: l.tabOrder ?? 0,
+            isModel: l.isModel ?? (l.name.toLowerCase() === "model"),
+            isActive: l.name === this.activeLayout
+        }))
+    }
+
+    GetActiveLayout() {
+        return this.activeLayout
+    }
+
+    GetImageDefs() {
+        return this.imageDefs || {}
+    }
+
+    async SetLayout(layoutName) {
+        if (!this.lastLoadParams) {
+            return
+        }
+        const isModel = layoutName.toLowerCase() === "model"
+        this.activeLayout = layoutName
+        this.options.sceneOptions = {
+            ...(this.options.sceneOptions || {}),
+            suppressPaperSpace: isModel,
+            layout: layoutName
+        }
+        await this.Load(this.lastLoadParams)
     }
 
     /** @return {Iterable<{name:String, color:number}>} List of layer names. */
@@ -292,11 +366,27 @@ export class DxfViewer {
             this.controls = null
         }
         this.scene.clear()
+        this.modelScene?.clear()
         for (const layer of this.layers.values()) {
             layer.Dispose()
         }
+        const disposedTextures = new Set()
+        for (const resource of this.imageResources) {
+            resource.material?.dispose()
+            if (resource.texture && !disposedTextures.has(resource.texture)) {
+                resource.texture.dispose()
+                disposedTextures.add(resource.texture)
+            }
+        }
+        this.imageResources = []
+        this.imageTexturePromises.clear()
+        this.missingImagePaths.clear()
         this.layers.clear()
         this.blocks.clear()
+        this.modelBlocks.clear()
+        this.modelScene = null
+        this.modelOrigin = null
+        this.viewports = []
         this.materials.each(e => e.material.dispose())
         this.materials.clear()
         this.SetView({x: 0, y: 0}, 2)
@@ -341,6 +431,7 @@ export class DxfViewer {
         cam.rotation.set(0, 0, 0)
         cam.updateMatrix()
         cam.updateProjectionMatrix()
+        cam.updateMatrixWorld(true)
         if (this.controls) {
             this.controls.target.set(cam.position.x, cam.position.y, 0)
             this.controls.update()
@@ -480,7 +571,268 @@ export class DxfViewer {
         this.SetSize(Math.floor(entry.contentRect.width), Math.floor(entry.contentRect.height))
     }
 
-    _LoadBatch(scene, batch) {
+    _LoadSceneGraph(scene, targetScene) {
+        const previousBlocks = this.blocks
+        const blocks = new Map()
+        this.blocks = blocks
+        try {
+            for (const batch of scene.batches) {
+                if (batch.key.blockName !== null &&
+                    batch.key.geometryType !== BatchingKey.GeometryType.BLOCK_INSTANCE &&
+                    batch.key.geometryType !== BatchingKey.GeometryType.POINT_INSTANCE) {
+
+                    let block = blocks.get(batch.key.blockName)
+                    if (!block) {
+                        block = new Block()
+                        blocks.set(batch.key.blockName, block)
+                    }
+                    block.PushBatch(new Batch(this, scene, batch))
+                }
+            }
+            for (const batch of scene.batches) {
+                this._LoadBatch(scene, batch, targetScene)
+            }
+        } finally {
+            this.blocks = previousBlocks
+        }
+        return blocks
+    }
+
+    _NormalizeImageName(name) {
+        const normalized = String(name || "").replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase()
+        return {
+            path: normalized,
+            basename: normalized.split("/").pop() || normalized
+        }
+    }
+
+    _CreateImageSourceMap(sources) {
+        const result = new Map()
+        for (const source of sources || []) {
+            const url = typeof source === "string" ? source : source.url
+            const names = typeof source === "string" ? [source] : (source.names || [])
+            for (const name of names) {
+                const normalized = this._NormalizeImageName(name)
+                result.set(normalized.path, url)
+                result.set(normalized.basename, url)
+            }
+        }
+        return result
+    }
+
+    async _GetImageTexture(url) {
+        let promise = this.imageTexturePromises.get(url)
+        if (!promise) {
+            promise = new three.TextureLoader().loadAsync(url).then(texture => {
+                texture.colorSpace = three.SRGBColorSpace
+                texture.needsUpdate = true
+                return texture
+            })
+            this.imageTexturePromises.set(url, promise)
+        }
+        return promise
+    }
+
+    _CreateImageGeometry(vertices, uvs = IMAGE_QUAD_UVS) {
+        const geometry = new three.BufferGeometry()
+        geometry.setAttribute("position", new three.Float32BufferAttribute(
+            vertices.flatMap(vertex => [vertex.x, vertex.y, 0]), 3))
+        geometry.setAttribute("uv", new three.Float32BufferAttribute(uvs, 2))
+        geometry.setIndex([0, 1, 2, 0, 2, 3])
+        return geometry
+    }
+
+    _CreateImageBoundary(vertices, layer) {
+        const geometry = new three.BufferGeometry()
+        geometry.setAttribute("position", new three.Float32BufferAttribute([
+            vertices[0].x, vertices[0].y, 0, vertices[1].x, vertices[1].y, 0,
+            vertices[1].x, vertices[1].y, 0, vertices[2].x, vertices[2].y, 0,
+            vertices[2].x, vertices[2].y, 0, vertices[3].x, vertices[3].y, 0,
+            vertices[3].x, vertices[3].y, 0, vertices[0].x, vertices[0].y, 0
+        ], 3))
+        const material = new three.LineBasicMaterial({
+            color: this._TransformColor(layer?.color ?? 0xffffff)
+        })
+        const object = new three.LineSegments(geometry, material)
+        object.frustumCulled = false
+        object._dxfViewerLayer = layer
+        this.imageResources.push({material})
+        return object
+    }
+
+    async _LoadImages(scene, targetScene, sources) {
+        const sourceMap = this._CreateImageSourceMap(sources)
+        for (const image of scene.images || []) {
+            if ((image.displayFlags & 1) === 0 || image.vertices?.length !== 4) {
+                continue
+            }
+            const layer = this.layers.get(image.layer) ?? this.defaultLayer
+            const normalized = this._NormalizeImageName(image.imagePath)
+            const url = sourceMap.get(normalized.path) ?? sourceMap.get(normalized.basename)
+            let object
+            if (url) {
+                try {
+                    const texture = await this._GetImageTexture(url)
+                    const geometry = this._CreateImageGeometry(image.vertices)
+                    const material = new three.MeshBasicMaterial({
+                        map: texture,
+                        transparent: true,
+                        opacity: Math.max(0, Math.min(1, (100 - image.fade) / 100)),
+                        depthTest: false,
+                        depthWrite: false,
+                        side: three.DoubleSide
+                    })
+                    object = new three.Mesh(geometry, material)
+                    object.frustumCulled = false
+                    object._dxfViewerLayer = layer
+                    this.imageResources.push({material, texture})
+                } catch (error) {
+                    console.warn(`Failed to load DXF image '${image.imagePath}':`, error)
+                }
+            }
+            if (!object) {
+                object = this._CreateImageBoundary(image.vertices, layer)
+                if (image.imagePath && !this.missingImagePaths.has(image.imagePath)) {
+                    this.missingImagePaths.add(image.imagePath)
+                    this._Message(`Referenced DXF image was not supplied: ${image.imagePath}`, MessageLevel.WARN)
+                }
+            }
+            targetScene.add(object)
+            layer.PushObject(object)
+        }
+    }
+
+    async _LoadOleFrames(scene, targetScene) {
+        if (!scene.oleFrames?.length) {
+            return
+        }
+        const {RenderOleSpreadsheet} = await import("./OleSpreadsheetRenderer.js")
+        for (const frame of scene.oleFrames || []) {
+            if (frame.vertices?.length !== 4 || !(frame.emfData instanceof ArrayBuffer)) {
+                continue
+            }
+            const layer = this.layers.get(frame.layer) ?? this.defaultLayer
+            let object
+            try {
+                const spreadsheetCanvas = await RenderOleSpreadsheet(frame.oleData)
+                let texture
+                if (spreadsheetCanvas) {
+                    texture = new three.CanvasTexture(spreadsheetCanvas)
+                    texture.colorSpace = three.SRGBColorSpace
+                    texture.needsUpdate = true
+                } else {
+                    const dataUrl = await convertEmfToDataUrl(frame.emfData, {
+                        maxWidth: 4096,
+                        maxHeight: 4096,
+                        maxCanvasDimension: 4096,
+                        dpiScale: 2
+                    })
+                    if (dataUrl) {
+                        texture = await this._GetImageTexture(dataUrl)
+                    }
+                }
+                if (texture) {
+                    const geometry = this._CreateImageGeometry(frame.vertices, OLE_FRAME_QUAD_UVS)
+                    const material = new three.MeshBasicMaterial({
+                        map: texture,
+                        transparent: true,
+                        depthTest: false,
+                        depthWrite: false,
+                        side: three.DoubleSide
+                    })
+                    object = new three.Mesh(geometry, material)
+                    object.frustumCulled = false
+                    object._dxfViewerLayer = layer
+                    this.imageResources.push({material, texture})
+                }
+            } catch (error) {
+                console.warn("Failed to render embedded DXF OLE frame:", error)
+            }
+            if (!object) {
+                object = this._CreateImageBoundary(frame.vertices, layer)
+            }
+            targetScene.add(object)
+            layer.PushObject(object)
+        }
+    }
+
+    _RenderViewport(viewport) {
+        this.camera.updateMatrixWorld(true)
+        const center = new three.Vector3(
+            viewport.center.x - this.origin.x,
+            viewport.center.y - this.origin.y,
+            0)
+        const bottomLeft = new three.Vector3(
+            center.x - viewport.width / 2,
+            center.y - viewport.height / 2,
+            0).project(this.camera)
+        const topRight = new three.Vector3(
+            center.x + viewport.width / 2,
+            center.y + viewport.height / 2,
+            0).project(this.camera)
+
+        const x = (bottomLeft.x + 1) * this.canvasWidth / 2
+        const y = (bottomLeft.y + 1) * this.canvasHeight / 2
+        const width = (topRight.x - bottomLeft.x) * this.canvasWidth / 2
+        const height = (topRight.y - bottomLeft.y) * this.canvasHeight / 2
+        if (width <= 0 || height <= 0) {
+            return
+        }
+
+        const scissorX = Math.max(0, x)
+        const scissorY = Math.max(0, y)
+        const scissorWidth = Math.min(this.canvasWidth, x + width) - scissorX
+        const scissorHeight = Math.min(this.canvasHeight, y + height) - scissorY
+        if (scissorWidth <= 0 || scissorHeight <= 0) {
+            return
+        }
+
+        const modelHeight = viewport.viewHeight
+        const modelWidth = modelHeight * viewport.width / viewport.height
+        const horizontalStart = (scissorX - x) / width
+        const horizontalEnd = (scissorX + scissorWidth - x) / width
+        const verticalStart = (scissorY - y) / height
+        const verticalEnd = (scissorY + scissorHeight - y) / height
+        const modelLeft = -modelWidth / 2
+        const modelBottom = -modelHeight / 2
+        const camera = this.viewportCamera
+        camera.left = modelLeft + modelWidth * horizontalStart
+        camera.right = modelLeft + modelWidth * horizontalEnd
+        camera.bottom = modelBottom + modelHeight * verticalStart
+        camera.top = modelBottom + modelHeight * verticalEnd
+        camera.position.set(
+            viewport.viewCenter.x - this.modelOrigin.x,
+            viewport.viewCenter.y - this.modelOrigin.y,
+            1)
+        camera.rotation.set(0, 0, -(viewport.viewTwistAngle || 0) * Math.PI / 180)
+        camera.updateProjectionMatrix()
+        camera.updateMatrixWorld(true)
+
+        this.renderer.setViewport(scissorX, scissorY, scissorWidth, scissorHeight)
+        this.renderer.setScissor(scissorX, scissorY, scissorWidth, scissorHeight)
+        this.renderer.setScissorTest(true)
+        this.renderer.clearDepth()
+
+        const hiddenObjects = []
+        for (const layerName of viewport.frozenLayers || []) {
+            const layer = this.layers.get(layerName)
+            for (const object of layer?.objects || []) {
+                if (object.visible) {
+                    object.visible = false
+                    hiddenObjects.push(object)
+                }
+            }
+        }
+        try {
+            this.renderer.render(this.modelScene, camera)
+        } finally {
+            for (const object of hiddenObjects) {
+                object.visible = true
+            }
+        }
+    }
+
+    _LoadBatch(scene, batch, targetScene = this.scene) {
         if (batch.key.blockName !== null &&
             batch.key.geometryType !== BatchingKey.GeometryType.BLOCK_INSTANCE &&
             batch.key.geometryType !== BatchingKey.GeometryType.POINT_INSTANCE) {
@@ -490,7 +842,7 @@ export class DxfViewer {
         const objects = new Batch(this, scene, batch).CreateObjects()
 
         for (const obj of objects) {
-            this.scene.add(obj)
+            targetScene.add(obj)
             const layer = obj._dxfViewerLayer ?? this.defaultLayer
             layer.PushObject(obj)
         }

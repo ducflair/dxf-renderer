@@ -10,6 +10,8 @@ export type DxfSceneOptions = {
     minArcTessellationSubdivisions?: number,
     wireframeMesh?: boolean,
     suppressPaperSpace?: boolean,
+    suppressNonPlotLayers?: boolean,
+    layout?: string,
     textOptions?: TextRendererOptions,
 }
 
@@ -33,9 +35,21 @@ export type DxfViewerOptions = {
     renderer?: THREE.WebGLRenderer | null,
 }
 
+export type DxfViewerFontSource = string | {url: string, names?: string[]}
+export type DxfViewerImageSource = string | {url: string, names: string[]}
+
+export type DxfLayoutInfo = {
+    id: string,
+    name: string,
+    tabOrder: number,
+    isModel: boolean,
+    isActive: boolean,
+}
+
 export type DxfViewerLoadParams = {
     url: string,
-    fonts?: string[] | null,
+    fonts?: DxfViewerFontSource[] | null,
+    images?: DxfViewerImageSource[] | null,
     progressCbk?: ((phase: "font" | "fetch" | "parse" | "prepare",
                    processedSize: number, totalSize: number) => void) | null,
     workerFactory?: (() => Worker) | null
@@ -58,6 +72,10 @@ export declare class DxfViewer {
     GetCamera(): THREE.OrthographicCamera
     GetCanvas(): HTMLCanvasElement
     GetLayers(): Iterable<LayerInfo>
+    GetLayouts(): DxfLayoutInfo[]
+    GetActiveLayout(): string | null
+    GetImageDefs(): Record<string, unknown>
+    SetLayout(layoutName: string): Promise<void>
     GetOrigin(): THREE.Vector2
     GetBounds(): {maxX: number, maxY: number, minX: number, minY: number} | null
     GetRenderer(): THREE.WebGLRenderer | null
@@ -75,6 +93,8 @@ export declare class DxfViewer {
 export declare namespace DxfViewer {
     export function SetupWorker(): void
 }
+
+export declare function SetupWorker(): void
 
 export type PatternLineDef = {
     angle: number

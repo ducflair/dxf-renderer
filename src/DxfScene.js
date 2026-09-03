@@ -98,6 +98,8 @@ export class DxfScene {
         this.pointShapeBlock = null
         this.numBlocksFlattened = 0
         this.numEntitiesFiltered = 0
+        this.images = []
+        this.oleFrames = []
     }
 
     /** Build the scene from the provided parsed DXF.
@@ -148,6 +150,11 @@ export class DxfScene {
             }
         }
 
+        this.imageDefs = dxf.imageDefs || {}
+        this.layouts = dxf.layouts || []
+        this.activeLayout = this.options.layout || (this.layouts.find(l => !l.isModel)?.name ?? "Model")
+        this.activeLayoutInfo = this.layouts.find(l => l.name === this.activeLayout) ?? null
+
         this.textRenderer = new TextRenderer(fontFetchers, this.options.textOptions)
         this.hasMissingChars = false
         await this._FetchFonts(dxf)
@@ -174,7 +181,7 @@ export class DxfScene {
             if (block.data.hasOwnProperty("entities")) {
                 const blockCtx = block.DefinitionContext()
                 for (const entity of block.data.entities) {
-                    if (!this._FilterEntity(entity)) {
+                    if (!this._FilterEntity(entity, true)) {
                         continue
                     }
                     this._ProcessDxfEntity(entity, blockCtx)
@@ -204,18 +211,28 @@ export class DxfScene {
     }
 
     /** @return False to suppress the specified entity, true to permit rendering. */
-    _FilterEntity(entity) {
+    _FilterEntity(entity, ignoreSpace = false) {
         if (entity.hidden) {
             return false
         }
         const layerName = this._GetEntityLayer(entity)
-        if (layerName != "0") {
-            const layer = this.layers.get(layerName)
-            if (layer?.frozen) {
-                return false
-            }
+        const layer = this.layers.get(layerName)
+        if (layer?.frozen || layer?.visible === false ||
+            (this.options.suppressNonPlotLayers && layer?.plot === false)) {
+            return false
         }
-        return !this.options.suppressPaperSpace || !entity.inPaperSpace
+        if (ignoreSpace) {
+            return true
+        }
+        const isModel = this.activeLayoutInfo?.isModel ?? this.activeLayout === "Model"
+        if (isModel) {
+            return !entity.inPaperSpace
+        }
+        if (!entity.inPaperSpace) {
+            return false
+        }
+        const ownerHandle = this.activeLayoutInfo?.blockRecordHandle
+        return !ownerHandle || !entity.ownerHandle || entity.ownerHandle === ownerHandle
     }
 
     async _FetchFonts(dxf) {
@@ -227,13 +244,14 @@ export class DxfScene {
         }
 
         /* Should return false if unable to resolve some characters, true otherwise. */
-        const ProcessEntity = async (entity) => {
-            if (!this._FilterEntity(entity)) {
+        const ProcessEntity = async (entity, ignoreSpace = false) => {
+            if (!this._FilterEntity(entity, ignoreSpace)) {
                 return true
             }
             let ret
+            const fontName = this._GetEntityTextStyle(entity)?.font ?? null
             if (entity.type === "TEXT" || entity.type === "ATTRIB" || entity.type === "ATTDEF") {
-                ret = await this.textRenderer.FetchFonts(ParseSpecialChars(entity.text))
+                ret = await this.textRenderer.FetchFonts(ParseSpecialChars(entity.text), fontName)
 
             } else if (entity.type === "MTEXT") {
                 const parser = new MTextFormatParser()
@@ -241,7 +259,7 @@ export class DxfScene {
                 ret = true
                 //XXX formatted MTEXT may specify some fonts explicitly, this is not yet supported
                 for (const text of parser.GetText()) {
-                    if (!await this.textRenderer.FetchFonts(ParseSpecialChars(text))) {
+                    if (!await this.textRenderer.FetchFonts(ParseSpecialChars(text), fontName)) {
                         ret = false
                         break
                     }
@@ -285,7 +303,7 @@ export class DxfScene {
             if (block.data.hasOwnProperty("entities")) {
                 for (const entity of block.data.entities) {
                     if (IsTextEntity(entity)) {
-                        if (!await ProcessEntity(entity)) {
+                        if (!await ProcessEntity(entity, true)) {
                             return
                         }
                     }
@@ -341,8 +359,24 @@ export class DxfScene {
         case "ATTRIB":
             renderEntities = this._DecomposeAttribute(entity, blockCtx)
             break
+        case "ATTDEF":
+            if (!blockCtx || entity.constant) {
+                renderEntities = this._DecomposeAttribute(entity, blockCtx)
+            } else {
+                return
+            }
+            break
         case "HATCH":
             renderEntities = this._DecomposeHatch(entity, blockCtx)
+            break
+        case "IMAGE":
+            this._ProcessImage(entity, blockCtx)
+            return
+        case "OLE2FRAME":
+            this._ProcessOle2Frame(entity, blockCtx)
+            return
+        case "VIEWPORT":
+            renderEntities = this._DecomposeViewport(entity, blockCtx)
             break
         default:
             console.log("Unhandled entity type: " + entity.type)
@@ -666,22 +700,32 @@ export class DxfScene {
             return;
         }
 
-        const insertEntity = this.inserts.get(entity.ownerHandle)
-        const layer = this._GetEntityLayer(insertEntity ?? entity, blockCtx)
-        const color = this._GetEntityColor(insertEntity ?? entity, blockCtx)
+        const insertEntity = entity.ownerHandle ? this.inserts.get(entity.ownerHandle) : null
+        const layer = this._GetEntityLayer(entity.layer != null ? entity : (insertEntity ?? entity), blockCtx)
+        let color
+        if (entity.colorIndex === 0 && insertEntity) {
+            color = this._GetEntityColor(insertEntity, blockCtx)
+        } else {
+            color = this._GetEntityColor(entity, blockCtx)
+        }
 
-        //XXX lookup font style attributes
+        const style = this._GetEntityTextStyle(entity)
+        const fixedHeight = style?.fixedTextHeight === 0 ? null : style?.fixedTextHeight
+        const fontSize = entity.textHeight || (fixedHeight ?? 1)
+        const widthFactor = entity.scale ?? entity.xScale ?? style?.widthFactor ?? 1
 
         yield* this.textRenderer.Render({
             text: ParseSpecialChars(entity.text),
-            fontSize: entity.textHeight * entity.scale,
+            fontSize,
             startPos: entity.startPoint,
             endPos: entity.endPoint,
             rotation: entity.rotation,
             hAlign: entity.horizontalJustification,
             vAlign: entity.verticalJustification,
+            widthFactor,
             color,
-            layer
+            layer,
+            fontName: style?.font ?? null
         })
     }
 
@@ -874,14 +918,15 @@ export class DxfScene {
         const fixedHeight = style?.fixedTextHeight === 0 ? null : style?.fixedTextHeight
         yield* this.textRenderer.Render({
             text: ParseSpecialChars(entity.text),
-            fontSize: entity.textHeight ?? (fixedHeight ?? 1),
+            fontSize: entity.textHeight || (fixedHeight ?? 1),
             startPos: entity.startPoint,
             endPos: entity.endPoint,
             rotation: entity.rotation,
             hAlign: entity.halign,
             vAlign: entity.valign,
-            widthFactor: entity.xScale,
-            color, layer
+            widthFactor: entity.xScale ?? style?.widthFactor ?? 1,
+            color, layer,
+            fontName: style?.font ?? null
         })
     }
 
@@ -905,7 +950,98 @@ export class DxfScene {
             attachment: entity.attachmentPoint,
             lineSpacing: entity.lineSpacing,
             width: entity.width,
-            color, layer
+            color, layer,
+            fontName: style?.font ?? null
+        })
+    }
+
+    _ProcessImage(entity, blockCtx) {
+        const imageDef = (this.imageDefs && entity.imageDefHandle) ? this.imageDefs[entity.imageDefHandle] : null
+        const imagePath = imageDef?.imagePath ?? ""
+        const p = entity.insertionPoint || { x: 0, y: 0, z: 0 }
+        const u = entity.uVector || { x: 1, y: 0, z: 0 }
+        const v = entity.vVector || { x: 0, y: 1, z: 0 }
+        const w = entity.imageSize?.x ?? imageDef?.imageSize?.x ?? 0
+        const h = entity.imageSize?.y ?? imageDef?.imageSize?.y ?? 0
+
+        const p0 = { x: p.x, y: p.y, z: p.z || 0 }
+        const p1 = { x: p.x + w * u.x, y: p.y + w * u.y, z: (p.z || 0) + w * (u.z || 0) }
+        const p2 = { x: p.x + w * u.x + h * v.x, y: p.y + w * u.y + h * v.y, z: (p.z || 0) + w * (u.z || 0) + h * (v.z || 0) }
+        const p3 = { x: p.x + h * v.x, y: p.y + h * v.y, z: (p.z || 0) + h * (v.z || 0) }
+
+        if (blockCtx) {
+            return
+        }
+
+        this.images.push({
+            imagePath,
+            imageDefHandle: entity.imageDefHandle ?? null,
+            vertices: [p0, p1, p2, p3].map(vertex => this._TransformVertex(vertex)),
+            layer: this._GetEntityLayer(entity),
+            displayFlags: entity.displayFlags ?? 7,
+            brightness: entity.brightness ?? 50,
+            contrast: entity.contrast ?? 50,
+            fade: entity.fade ?? 0,
+            clipping: entity.clipping ?? false,
+            clipBoundary: entity.clipBoundary ?? []
+        })
+    }
+
+    _ProcessOle2Frame(entity, blockCtx) {
+        if (blockCtx || !entity.upperLeft || !entity.lowerRight) {
+            return
+        }
+        const oleData = DecodeBinaryChunks(entity.binaryData)
+        const emfData = ExtractEmf(oleData)
+        if (!emfData) {
+            return
+        }
+
+        const upperLeft = entity.upperLeft
+        const lowerRight = entity.lowerRight
+        const vertices = [
+            upperLeft,
+            {x: lowerRight.x, y: upperLeft.y, z: upperLeft.z || 0},
+            lowerRight,
+            {x: upperLeft.x, y: lowerRight.y, z: lowerRight.z || 0}
+        ].map(vertex => this._TransformVertex(vertex))
+
+        this.oleFrames.push({
+            vertices,
+            layer: this._GetEntityLayer(entity),
+            oleData,
+            emfData
+        })
+    }
+
+    *_DecomposeViewport(entity, blockCtx) {
+        if (!entity.width || !entity.height || !entity.center) {
+            return
+        }
+        if ((entity.viewportId || 0) <= 1) {
+            return
+        }
+
+        const cx = entity.center.x || 0
+        const cy = entity.center.y || 0
+        const cz = entity.center.z || 0
+        const hw = entity.width / 2
+        const hh = entity.height / 2
+
+        const p0 = { x: cx - hw, y: cy - hh, z: cz }
+        const p1 = { x: cx + hw, y: cy - hh, z: cz }
+        const p2 = { x: cx + hw, y: cy + hh, z: cz }
+        const p3 = { x: cx - hw, y: cy + hh, z: cz }
+
+        const layer = this._GetEntityLayer(entity, blockCtx)
+        const color = this._GetEntityColor(entity, blockCtx)
+
+        yield new Entity({
+            type: Entity.Type.LINE_SEGMENTS,
+            vertices: [p0, p1, p1, p2, p2, p3, p3, p0],
+            indices: null,
+            color,
+            layer
         })
     }
 
@@ -2151,8 +2287,9 @@ export class DxfScene {
 
     /** @returns {TextStyle | null}  */
     _GetEntityTextStyle(entity) {
-        if (entity.hasOwnProperty("styleName")) {
-            return this.fontStyles.get(entity.styleName) ?? null
+        const styleName = entity.styleName ?? entity.textStyle
+        if (styleName) {
+            return this.fontStyles.get(styleName) ?? null
         }
         return null
     }
@@ -2274,6 +2411,11 @@ export class DxfScene {
         }
 
         scene.pointShapeHasDot = (this.pdMode & PdMode.MARK_MASK) === PdMode.DOT
+        scene.layouts = this.layouts
+        scene.activeLayout = this.activeLayout
+        scene.imageDefs = this.imageDefs
+        scene.images = this.images
+        scene.oleFrames = this.oleFrames
 
         return scene
     }
@@ -2848,6 +2990,57 @@ DxfScene.DefaultOptions = {
     wireframeMesh: false,
     /** Suppress paper-space entities when true (only model-space is rendered). */
     suppressPaperSpace: false,
+    /** Suppress entities on layers marked as non-plotting. */
+    suppressNonPlotLayers: true,
     /** Text rendering options. */
-    textOptions: TextRenderer.DefaultOptions,
+    get textOptions() {
+        return TextRenderer.DefaultOptions
+    },
+}
+
+function DecodeBinaryChunks(chunks) {
+    if (!Array.isArray(chunks) || chunks.length === 0) {
+        return null
+    }
+    let hex = ""
+    for (const chunk of chunks) {
+        hex += String(chunk).replace(/\s/g, "")
+    }
+    if (hex.length < 176 || hex.length % 2 !== 0) {
+        return null
+    }
+
+    const bytes = new Uint8Array(hex.length / 2)
+    for (let i = 0; i < bytes.length; i++) {
+        const value = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16)
+        if (!Number.isFinite(value)) {
+            return null
+        }
+        bytes[i] = value
+    }
+
+    return bytes.buffer
+}
+
+function ExtractEmf(data) {
+    if (!(data instanceof ArrayBuffer)) {
+        return null
+    }
+
+    const bytes = new Uint8Array(data)
+    const view = new DataView(data)
+    for (let signatureOffset = 40; signatureOffset + 48 <= bytes.length; signatureOffset++) {
+        if (view.getUint32(signatureOffset, true) !== 0x464d4520) {
+            continue
+        }
+        const start = signatureOffset - 40
+        const headerSize = view.getUint32(start + 4, true)
+        const byteLength = view.getUint32(start + 48, true)
+        if (view.getUint32(start, true) !== 1 || headerSize < 88 ||
+            byteLength < headerSize || start + byteLength > bytes.length) {
+            continue
+        }
+        return bytes.slice(start, start + byteLength).buffer
+    }
+    return null
 }

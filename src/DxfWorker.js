@@ -1,6 +1,6 @@
 import {DxfFetcher} from "./DxfFetcher.js"
 import {DxfScene} from "./DxfScene.js"
-import opentype from "opentype.js"
+import * as opentype from "opentype.js"
 
 const MSG_SIGNATURE = "DxfWorkerMsg"
 
@@ -85,6 +85,19 @@ export class DxfWorker {
             transfers.push(scene.vertices)
             transfers.push(scene.indices)
             transfers.push(scene.transforms)
+            for (const frame of scene.oleFrames || []) {
+                transfers.push(frame.oleData)
+                transfers.push(frame.emfData)
+            }
+            if (scene.modelScene) {
+                transfers.push(scene.modelScene.vertices)
+                transfers.push(scene.modelScene.indices)
+                transfers.push(scene.modelScene.transforms)
+                for (const frame of scene.modelScene.oleFrames || []) {
+                    transfers.push(frame.oleData)
+                    transfers.push(frame.emfData)
+                }
+            }
             return {scene, dxf}
         }
         case DxfWorker.WorkerMsg.DESTROY:
@@ -157,29 +170,80 @@ export class DxfWorker {
         if (progressCbk) {
             progressCbk("prepare", 0, null)
         }
+        if (!options.sceneOptions) {
+            options.sceneOptions = {}
+        }
+        if (options.sceneOptions.suppressPaperSpace === undefined && options.sceneOptions.layout === undefined) {
+            const sheets = (dxf.layouts || []).filter(l => !l.isModel)
+            if (sheets.length > 0) {
+                options.sceneOptions.suppressPaperSpace = false
+                options.sceneOptions.layout = sheets[0].name
+            } else {
+                options.sceneOptions.suppressPaperSpace = true
+                options.sceneOptions.layout = "Model"
+            }
+        }
         const dxfScene = new DxfScene(options)
         await dxfScene.Build(dxf, fontFetchers)
+        const activeLayout = (dxf.layouts || []).find(l => l.name === dxfScene.scene.activeLayout)
+        if (activeLayout && !activeLayout.isModel) {
+            const modelOptions = this._CloneOptions(options)
+            modelOptions.sceneOptions = {
+                ...(modelOptions.sceneOptions || {}),
+                suppressPaperSpace: true,
+                layout: "Model"
+            }
+            const modelDxfScene = new DxfScene(modelOptions)
+            await modelDxfScene.Build(dxf, fontFetchers)
+            dxfScene.scene.modelScene = modelDxfScene.scene
+            const layerNamesByHandle = new Map(Object.values(dxf.tables?.layer?.layers || {})
+                .filter(layer => layer.handle)
+                .map(layer => [layer.handle, layer.name]))
+            dxfScene.scene.viewports = dxf.entities.filter(entity =>
+                entity.type === "VIEWPORT" &&
+                entity.inPaperSpace &&
+                entity.ownerHandle === activeLayout.blockRecordHandle &&
+                (entity.viewportId ?? 0) > 1 &&
+                (entity.status ?? 0) > 0 &&
+                (entity.width ?? 0) > 0 &&
+                (entity.height ?? 0) > 0 &&
+                (entity.viewHeight ?? 0) > 0).map(entity => ({
+                    ...entity,
+                    frozenLayers: (entity.frozenLayerHandles || [])
+                        .map(handle => layerNamesByHandle.get(handle))
+                        .filter(Boolean)
+                }))
+        }
         return {scene: dxfScene.scene, dxf: options.retainParsedDxf === true ? dxf : undefined }
     }
 
-    _CreateFontFetchers(urls, progressCbk) {
+    _CreateFontFetchers(sources, progressCbk) {
 
-        function CreateFetcher(url) {
-            return async function() {
-                if (progressCbk) {
-                    progressCbk("font", 0, null)
+        function CreateFetcher(source) {
+            const url = typeof source === "string" ? source : source.url
+            let fontPromise = null
+            const fetcher = async function() {
+                if (!fontPromise) {
+                    if (progressCbk) {
+                        progressCbk("font", 0, null)
+                    }
+                    fontPromise = fetch(url)
+                        .then(response => response.arrayBuffer())
+                        .then(data => opentype.parse(data))
                 }
-                const data = await fetch(url).then(response => response.arrayBuffer())
+                const font = await fontPromise
                 if (progressCbk) {
                     progressCbk("prepare", 0, null)
                 }
-                return opentype.parse(data)
+                return font
             }
+            fetcher.fontNames = typeof source === "string" ? [] : (source.names ?? [])
+            return fetcher
         }
 
         const fetchers = []
-        for (const url of urls) {
-            fetchers.push(CreateFetcher(url))
+        for (const source of sources) {
+            fetchers.push(CreateFetcher(source))
         }
         return fetchers
     }

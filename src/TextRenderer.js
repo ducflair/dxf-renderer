@@ -7,6 +7,16 @@ import {MTextFormatParser} from "./MTextFormatParser.js"
 /** Regex for parsing special characters in text entities. */
 const SPECIAL_CHARS_RE = /(?:%%([dpcou%]))|(?:\\U\+([0-9a-f]{4}))/gi
 
+function NormalizeFontName(name) {
+    if (!name) {
+        return null
+    }
+    const basename = String(name).trim().replaceAll("\\", "/").split("/").pop()
+    return basename.toLowerCase()
+        .replace(/\.(?:ttf|otf|ttc|shx)$/i, "")
+        .replace(/(?:[-\s](?:regular|normal))+$/i, "")
+}
+
 /**
  * Parse special characters in text entities and convert them to corresponding unicode
  * characters.
@@ -59,8 +69,18 @@ export class TextRenderer {
      * @param options {?{}} See TextRenderer.DefaultOptions.
      */
     constructor(fontFetchers, options = null) {
-        this.fontFetchers = fontFetchers
+        this.fontFetchers = fontFetchers ? [...fontFetchers] : []
         this.fonts = []
+        this.preferredFontFetchers = new Map()
+        this.preferredFonts = new Map()
+        for (const fetcher of this.fontFetchers) {
+            for (const name of fetcher.fontNames ?? []) {
+                const normalized = NormalizeFontName(name)
+                if (normalized) {
+                    this.preferredFontFetchers.set(normalized, fetcher)
+                }
+            }
+        }
 
         this.options = Object.create(TextRenderer.DefaultOptions)
         if (options) {
@@ -81,12 +101,13 @@ export class TextRenderer {
      * @return {Boolean} True if all characters can be rendered, false if none of the provided fonts
      *  contains glyphs for some of the specified text characters.
      */
-    async FetchFonts(text) {
+    async FetchFonts(text, fontName = null) {
+        await this._FetchPreferredFont(fontName)
         if (!this.stubShapeLoaded) {
             this.stubShapeLoaded = true
             for (const char of Array.from(this.options.fallbackChar)) {
                 if (await this.FetchFonts(char)) {
-                    this.stubShape = this._CreateCharShape(char)
+                    this.stubShape = this._CreateCharShape(char, null)
                     break
                 }
             }
@@ -98,7 +119,7 @@ export class TextRenderer {
                 continue
             }
             let found = false
-            for (const font of this.fonts) {
+            for (const font of this._GetFonts(fontName)) {
                 if (font.HasChar(char)) {
                     found = true
                     break
@@ -113,7 +134,7 @@ export class TextRenderer {
             while (this.fontFetchers.length > 0) {
                 const fetcher = this.fontFetchers.shift()
                 const font = await this._FetchFont(fetcher)
-                this.fonts.push(font)
+                this._RegisterFont(font, fetcher)
                 if (font.HasChar(char)) {
                     found = true
                     break
@@ -134,10 +155,10 @@ export class TextRenderer {
      * @param text {string}
      * @param fontSize {number}
      */
-    GetLineWidth(text, fontSize) {
+    GetLineWidth(text, fontSize, fontName = null) {
         const block = new TextBlock(fontSize)
         for (const char of text) {
-            const shape = this._GetCharShape(char)
+            const shape = this._GetCharShape(char, fontName)
             if (!shape) {
                 continue
             }
@@ -161,10 +182,10 @@ export class TextRenderer {
      *  glyph.
      */
     *Render({text, startPos, endPos, rotation = 0, widthFactor = 1, hAlign = 0, vAlign = 0,
-             color, layer = null, fontSize}) {
+             color, layer = null, fontSize, fontName = null}) {
         const block = new TextBlock(fontSize)
         for (const char of text) {
-            const shape = this._GetCharShape(char)
+            const shape = this._GetCharShape(char, fontName)
             if (!shape) {
                 continue
             }
@@ -190,11 +211,11 @@ export class TextRenderer {
      *  glyph.
      */
     *RenderMText({formattedText, position, fontSize, width = null, rotation = 0, direction = null,
-                 attachment, lineSpacing = 1, color, layer = null}) {
+                 attachment, lineSpacing = 1, color, layer = null, fontName = null}) {
         if (!fontSize) {
             fontSize = 1;
         }
-        const box = new TextBox(fontSize, this._GetCharShape.bind(this))
+        const box = new TextBox(fontSize, char => this._GetCharShape(char, fontName))
         box.FeedText(formattedText)
         yield* box.Render(position, width, rotation, direction, attachment, lineSpacing, color,
                           layer)
@@ -204,18 +225,19 @@ export class TextRenderer {
      * Each shape is indexed triangles mesh for font size 1. They should be further transformed as
      * needed.
      */
-    _GetCharShape(char) {
-        let shape = this.shapes.get(char)
+    _GetCharShape(char, fontName = null) {
+        const key = `${NormalizeFontName(fontName) ?? ""}\0${char}`
+        let shape = this.shapes.get(key)
         if (shape) {
             return shape
         }
-        shape = this._CreateCharShape(char)
-        this.shapes.set(char, shape)
+        shape = this._CreateCharShape(char, fontName)
+        this.shapes.set(key, shape)
         return shape
     }
 
-    _CreateCharShape(char) {
-        for (const font of this.fonts) {
+    _CreateCharShape(char, fontName = null) {
+        for (const font of this._GetFonts(fontName)) {
             const path = font.GetCharPath(char)
             if (path) {
                 return new CharShape(font, path, this.options)
@@ -226,6 +248,42 @@ export class TextRenderer {
 
     async _FetchFont(fontFetcher) {
         return new Font(await fontFetcher())
+    }
+
+    async _FetchPreferredFont(fontName) {
+        const normalized = NormalizeFontName(fontName)
+        if (!normalized || this.preferredFonts.has(normalized)) {
+            return
+        }
+        const fetcher = this.preferredFontFetchers.get(normalized)
+        if (!fetcher) {
+            return
+        }
+        const index = this.fontFetchers.indexOf(fetcher)
+        if (index >= 0) {
+            this.fontFetchers.splice(index, 1)
+        }
+        this._RegisterFont(await this._FetchFont(fetcher), fetcher)
+    }
+
+    _RegisterFont(font, fetcher) {
+        if (!this.fonts.includes(font)) {
+            this.fonts.push(font)
+        }
+        for (const name of fetcher.fontNames ?? []) {
+            const normalized = NormalizeFontName(name)
+            if (normalized) {
+                this.preferredFonts.set(normalized, font)
+            }
+        }
+    }
+
+    _GetFonts(fontName) {
+        const preferred = this.preferredFonts.get(NormalizeFontName(fontName))
+        if (!preferred) {
+            return this.fonts
+        }
+        return [preferred, ...this.fonts.filter(font => font !== preferred)]
     }
 }
 

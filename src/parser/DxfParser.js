@@ -18,6 +18,7 @@ import Solid from "./entities/solid.js";
 import Spline from "./entities/spline.js";
 import Text from "./entities/text.js";
 import Hatch from "./entities/hatch.js";
+import * as helpers from "./ParseHelpers.js";
 import dimStyleCodes from "./DimStyleCodes.js";
 //import Vertex from "./entities/.js";
 
@@ -29,6 +30,192 @@ import log from 'loglevel';
 //log.setLevel('warn');
 log.setLevel('error');
 //log.setLevel('silent');
+
+function Image() {}
+
+Image.ForEntityName = "IMAGE";
+
+Image.prototype.parseEntity = function (scanner, curr) {
+    const entity = {
+        type: curr.value,
+        insertionPoint: { x: 0, y: 0, z: 0 },
+        uVector: { x: 1, y: 0, z: 0 },
+        vVector: { x: 0, y: 1, z: 0 },
+        imageSize: { x: 0, y: 0 },
+        displayFlags: 7,
+        clipping: false,
+        brightness: 50,
+        contrast: 50,
+        fade: 0,
+        clipBoundary: [],
+    };
+
+    curr = scanner.next();
+    while (curr !== "EOF") {
+        if (curr.code === 0) break;
+        switch (curr.code) {
+        case 10:
+            entity.insertionPoint = helpers.parsePoint(scanner);
+            break;
+        case 11:
+            entity.uVector = helpers.parsePoint(scanner);
+            break;
+        case 12:
+            entity.vVector = helpers.parsePoint(scanner);
+            break;
+        case 13:
+            entity.imageSize.x = curr.value;
+            break;
+        case 23:
+            entity.imageSize.y = curr.value;
+            break;
+        case 340:
+            entity.imageDefHandle = curr.value;
+            break;
+        case 70:
+            entity.displayFlags = curr.value;
+            break;
+        case 280:
+            entity.clipping = curr.value !== 0;
+            break;
+        case 281:
+            entity.brightness = curr.value;
+            break;
+        case 282:
+            entity.contrast = curr.value;
+            break;
+        case 283:
+            entity.fade = curr.value;
+            break;
+        case 14: {
+            const point = { x: curr.value, y: 0 };
+            const next = scanner.next();
+            if (next && next.code === 24) point.y = next.value;
+            entity.clipBoundary.push(point);
+            break;
+        }
+        case 100:
+            break;
+        case 101:
+            helpers.skipEmbeddedObject(scanner);
+            break;
+        default:
+            helpers.checkCommonEntityProperties(entity, curr, scanner);
+            break;
+        }
+        curr = scanner.next();
+    }
+    return entity;
+};
+
+function Viewport() {}
+
+Viewport.ForEntityName = "VIEWPORT";
+
+Viewport.prototype.parseEntity = function (scanner, curr) {
+    const entity = {
+        type: curr.value,
+        center: { x: 0, y: 0, z: 0 },
+        width: 0,
+        height: 0,
+        viewCenter: { x: 0, y: 0 },
+        viewHeight: 0,
+        viewTwistAngle: 0,
+        viewportId: 0,
+        status: 0,
+        frozenLayerHandles: [],
+    };
+
+    curr = scanner.next();
+    while (curr !== "EOF") {
+        if (curr.code === 0) break;
+        switch (curr.code) {
+        case 10:
+            entity.center = helpers.parsePoint(scanner);
+            break;
+        case 40:
+            entity.width = curr.value;
+            break;
+        case 41:
+            entity.height = curr.value;
+            break;
+        case 12:
+            entity.viewCenter.x = curr.value;
+            break;
+        case 22:
+            entity.viewCenter.y = curr.value;
+            break;
+        case 45:
+            entity.viewHeight = curr.value;
+            break;
+        case 51:
+            entity.viewTwistAngle = curr.value;
+            break;
+        case 68:
+            entity.status = curr.value;
+            break;
+        case 69:
+            entity.viewportId = curr.value;
+            break;
+        case 331:
+            entity.frozenLayerHandles.push(curr.value);
+            break;
+        default:
+            helpers.checkCommonEntityProperties(entity, curr, scanner);
+            break;
+        }
+        curr = scanner.next();
+    }
+    return entity;
+};
+
+function Ole2Frame() {}
+
+Ole2Frame.ForEntityName = "OLE2FRAME";
+
+Ole2Frame.prototype.parseEntity = function (scanner, curr) {
+    const entity = {
+        type: curr.value,
+        upperLeft: { x: 0, y: 0, z: 0 },
+        lowerRight: { x: 0, y: 0, z: 0 },
+        binaryData: [],
+    };
+
+    curr = scanner.next();
+    while (curr !== "EOF") {
+        if (curr.code === 0) break;
+        switch (curr.code) {
+        case 10:
+            entity.upperLeft = helpers.parsePoint(scanner);
+            break;
+        case 11:
+            entity.lowerRight = helpers.parsePoint(scanner);
+            break;
+        case 70:
+            entity.oleVersion = curr.value;
+            break;
+        case 72:
+            entity.aspect = curr.value;
+            break;
+        case 73:
+            entity.quality = curr.value;
+            break;
+        case 90:
+            entity.binaryDataLength = curr.value;
+            break;
+        case 310:
+            entity.binaryData.push(curr.value);
+            break;
+        case 100:
+            break;
+        default:
+            helpers.checkCommonEntityProperties(entity, curr, scanner);
+            break;
+        }
+        curr = scanner.next();
+    }
+    return entity;
+};
 
 function registerDefaultEntityHandlers(dxfParser) {
     // Supported entities here (some entity code is still being refactored into this flow)
@@ -49,6 +236,9 @@ function registerDefaultEntityHandlers(dxfParser) {
     dxfParser.registerEntityHandler(Spline);
     dxfParser.registerEntityHandler(Text);
     dxfParser.registerEntityHandler(Hatch);
+    dxfParser.registerEntityHandler(Image);
+    dxfParser.registerEntityHandler(Viewport);
+    dxfParser.registerEntityHandler(Ole2Frame);
     //dxfParser.registerEntityHandler(require('./entities/vertex'));
 }
 
@@ -142,6 +332,12 @@ DxfParser.prototype._parse = function(dxfString) {
                 } else if(curr.value === 'TABLES') {
                     log.debug('> TABLES');
                     dxf.tables = parseTables();
+                    log.debug('<');
+                } else if(curr.value === 'OBJECTS') {
+                    log.debug('> OBJECTS');
+                    const objects = parseObjects();
+                    dxf.layouts = objects.layouts;
+                    dxf.imageDefs = objects.imageDefs;
                     log.debug('<');
                 } else if(curr.value === 'EOF') {
                     log.debug('EOF');
@@ -602,6 +798,10 @@ DxfParser.prototype._parse = function(dxfString) {
                     layerName = curr.value;
                     curr = scanner.next();
                     break;
+                case 5: // layer handle
+                    layer.handle = curr.value;
+                    curr = scanner.next();
+                    break;
                 case 62: // color, visibility
                     layer.visible = curr.value >= 0;
                     // TODO 0 and 256 are BYBLOCK and BYLAYER respectively. Need to handle these values for layers?.
@@ -611,6 +811,10 @@ DxfParser.prototype._parse = function(dxfString) {
                     break;
                 case 70: // frozen layer
                     layer.frozen = ((curr.value & 1) !== 0 || (curr.value & 2) !== 0);
+                    curr = scanner.next();
+                    break;
+                case 290: // plotting flag
+                    layer.plot = curr.value;
                     curr = scanner.next();
                     break;
                 case 420: // TrueColor Color
@@ -872,6 +1076,114 @@ DxfParser.prototype._parse = function(dxfString) {
         return point;
     };
 
+    var parseObjects = function() {
+        var objects = {
+            layouts: [],
+            imageDefs: {}
+        };
+
+        curr = scanner.next();
+        while (curr !== 'EOF') {
+            if (groupIs(0, 'ENDSEC')) {
+                break;
+            }
+
+            if (curr.code === 0) {
+                var objType = curr.value;
+                if (objType === 'LAYOUT') {
+                    var layout = {
+                        handle: null,
+                        name: null,
+                        tabOrder: 0,
+                        blockRecordHandle: null,
+                        isModel: false,
+                        paperLimits: { minX: 0, minY: 0, maxX: 0, maxY: 0 }
+                    };
+                    curr = scanner.next();
+                    while (curr.code !== 0 && curr !== 'EOF') {
+                        switch (curr.code) {
+                            case 5:
+                                layout.handle = curr.value;
+                                break;
+                            case 1:
+                                layout.name = curr.value;
+                                break;
+                            case 70:
+                                layout.layoutFlags = curr.value;
+                                break;
+                            case 71:
+                                layout.tabOrder = typeof curr.value === 'number' ? curr.value : parseInt(curr.value, 10);
+                                break;
+                            case 330:
+                                layout.blockRecordHandle = curr.value;
+                                break;
+                            case 10:
+                                layout.paperLimits.minX = curr.value;
+                                break;
+                            case 20:
+                                layout.paperLimits.minY = curr.value;
+                                break;
+                            case 11:
+                                layout.paperLimits.maxX = curr.value;
+                                break;
+                            case 21:
+                                layout.paperLimits.maxY = curr.value;
+                                break;
+                        }
+                        curr = scanner.next();
+                    }
+                    if (layout.name) {
+                        layout.isModel = layout.name.toLowerCase() === 'model';
+                        objects.layouts.push(layout);
+                    }
+                    continue;
+                } else if (objType === 'IMAGEDEF') {
+                    var imageDef = {
+                        handle: null,
+                        imagePath: null,
+                        imageSize: { x: 0, y: 0 },
+                        pixelSize: { x: 1, y: 1 },
+                        isLoaded: true
+                    };
+                    curr = scanner.next();
+                    while (curr.code !== 0 && curr !== 'EOF') {
+                        switch (curr.code) {
+                            case 5:
+                                imageDef.handle = curr.value;
+                                break;
+                            case 1:
+                                imageDef.imagePath = curr.value;
+                                break;
+                            case 10:
+                                imageDef.imageSize.x = curr.value;
+                                break;
+                            case 20:
+                                imageDef.imageSize.y = curr.value;
+                                break;
+                            case 11:
+                                imageDef.pixelSize.x = curr.value;
+                                break;
+                            case 21:
+                                imageDef.pixelSize.y = curr.value;
+                                break;
+                            case 280:
+                                imageDef.isLoaded = curr.value !== 0;
+                                break;
+                        }
+                        curr = scanner.next();
+                    }
+                    if (imageDef.handle) {
+                        objects.imageDefs[imageDef.handle] = imageDef;
+                    }
+                    continue;
+                }
+            }
+            curr = scanner.next();
+        }
+
+        return objects;
+    };
+
     var ensureHandle = function(entity) {
         if (!entity) {
             throw new TypeError('entity cannot be undefined or null');
@@ -883,6 +1195,31 @@ DxfParser.prototype._parse = function(dxfString) {
     }
 
     parseAll();
+
+    if (!dxf.layouts) {
+        dxf.layouts = [];
+    }
+    if (!dxf.imageDefs) {
+        dxf.imageDefs = {};
+    }
+
+    // Ensure Model layout exists
+    var hasModel = dxf.layouts.some(function(l) { return l.isModel; });
+    if (!hasModel) {
+        dxf.layouts.unshift({
+            handle: "0",
+            name: "Model",
+            tabOrder: 0,
+            isModel: true
+        });
+    }
+
+    // Sort layouts: Model first (tabOrder 0), then sheets sorted by tabOrder
+    dxf.layouts.sort(function(a, b) {
+        if (a.isModel !== b.isModel) return a.isModel ? -1 : 1;
+        return (a.tabOrder ?? 0) - (b.tabOrder ?? 0);
+    });
+
     return dxf;
 };
 

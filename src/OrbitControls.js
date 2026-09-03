@@ -517,7 +517,9 @@ export const OrbitControls = function ( object, domElement ) {
 	function handleMouseDownDolly( event ) {
 
 		const canvasRect = scope.domElement.getBoundingClientRect();
-		dollyCenter.set( event.clientX - canvasRect.left, event.clientY - canvasRect.top );
+		dollyCenter.set(
+			(event.clientX - canvasRect.left) * window.devicePixelRatio,
+			(event.clientY - canvasRect.top) * window.devicePixelRatio );
 		dollyStart.set( event.clientX, event.clientY );
 
 	}

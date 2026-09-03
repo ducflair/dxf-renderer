@@ -89,6 +89,9 @@ EntityParser.prototype.parseEntity = function (scanner, curr) {
                 break;
             case 100:
                 break;
+            case 101:
+                helpers.skipEmbeddedObject(scanner);
+                break;
             case 210:
                 entity.extrusionDirection = helpers.parsePoint(scanner);
                 break;

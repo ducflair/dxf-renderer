@@ -40,6 +40,11 @@ EntityParser.prototype.parseEntity = function(scanner, curr) {
         case 73: // Vertical alignment
             entity.valign = curr.value;
             break;
+        case 100:
+            break;
+        case 101:
+            helpers.skipEmbeddedObject(scanner);
+            break;
         default: // check common entity attributes
             helpers.checkCommonEntityProperties(entity, curr, scanner);
             break;

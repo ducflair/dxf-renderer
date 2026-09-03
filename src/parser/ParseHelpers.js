@@ -117,6 +117,9 @@ export function checkCommonEntityProperties(entity, curr, scanner) {
         case 100:
             //ignore
             break;
+        case 101:
+            skipEmbeddedObject(scanner);
+            break;
         case 330:
             entity.ownerHandle = curr.value;
             break;
