@@ -5,6 +5,8 @@ High-performance 2D DXF renderer and viewer component for WebGL (via [Three.js](
 > [!NOTE]
 > `dxf-renderer` is an actively maintained TypeScript fork of [`dxf-viewer`](https://github.com/vagran/dxf-viewer) originally created by [Artyom Lebedev](https://github.com/vagran) / [SIA SPH Engineering](https://www.sphengineering.com).
 
+[**Live Demo (Client-Side Viewer)**](https://ducflair.github.io/dxf-renderer/)
+
 ## Install
 
 ```bash

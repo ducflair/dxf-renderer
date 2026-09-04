@@ -759,8 +759,10 @@ class TextBox {
             }
         }
 
+        const effectiveAttachment = attachment || MTextAttachment.TOP_LEFT;
+
         let defaultAlignment: number = ParagraphAlignment.LEFT;
-        switch (attachment) {
+        switch (effectiveAttachment) {
         case MTextAttachment.TOP_CENTER:
         case MTextAttachment.MIDDLE_CENTER:
         case MTextAttachment.BOTTOM_CENTER:
@@ -795,7 +797,7 @@ class TextBox {
         height *= lineHeight;
 
         let origin = new Vector2();
-        switch (attachment) {
+        switch (effectiveAttachment) {
         case MTextAttachment.TOP_LEFT:
             break;
         case MTextAttachment.TOP_CENTER:
@@ -827,7 +829,7 @@ class TextBox {
             origin.y = -height;
             break;
         default:
-            throw new Error("Unhandled alignment");
+            break;
         }
 
         const transform = new Matrix3().translate(-origin.x, -origin.y)

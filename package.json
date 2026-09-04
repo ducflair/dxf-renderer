@@ -44,7 +44,9 @@
     "access": "public"
   },
   "scripts": {
+    "dev": "bun run scripts/serve-demo.ts",
     "build:ts": "bun run build.ts",
+    "build:demo": "bun run scripts/build-demo.ts",
     "build": "bun run build:ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",

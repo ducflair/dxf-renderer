@@ -102,9 +102,13 @@ export class DxfScene {
 
 
     constructor(options) {
-        this.options = Object.create(DxfScene.DefaultOptions)
-        if (options) {
-            Object.assign(this.options, options.sceneOptions)
+        this.options = {
+            ...DxfScene.DefaultOptions,
+            ...(options?.sceneOptions || {}),
+            textOptions: {
+                ...TextRenderer.DefaultOptions,
+                ...(options?.sceneOptions?.textOptions || {})
+            }
         }
 
         /* Scene origin. All input coordinates are made local to this point to minimize precision
@@ -3069,9 +3073,7 @@ DxfScene.DefaultOptions = {
     /** Suppress entities on layers marked as non-plotting. */
     suppressNonPlotLayers: true,
     /** Text rendering options. */
-    get textOptions() {
-        return TextRenderer.DefaultOptions
-    },
+    textOptions: TextRenderer.DefaultOptions,
 }
 
 function DecodeBinaryChunks(chunks) {

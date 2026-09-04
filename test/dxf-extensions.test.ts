@@ -209,4 +209,19 @@ describe("DXF extensions", () => {
         ])
         geometry.dispose()
     })
+
+    test("DxfScene constructor accepts options with textOptions without getter conflict", () => {
+        const options = {
+            sceneOptions: {
+                textOptions: {
+                    curveSubdivision: 6,
+                    fallbackChar: "#"
+                }
+            }
+        };
+        const scene = new DxfScene(options);
+        expect(scene.options.textOptions.curveSubdivision).toBe(6);
+        expect(scene.options.textOptions.fallbackChar).toBe("#");
+    });
 })
+
