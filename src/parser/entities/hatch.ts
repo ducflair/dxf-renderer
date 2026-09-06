@@ -221,6 +221,9 @@ function ParseBoundaryLoop(curr, scanner) {
             case 40:
             case 42:
             case 97:
+                if (!isSpline) {
+                    return e
+                }
                 break;
             default:
                 return e

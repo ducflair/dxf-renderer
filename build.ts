@@ -26,14 +26,6 @@ if (existsSync(distDir)) {
 const externals = [
   'three',
   'three/*',
-  'cfb',
-  'cfb/*',
-  'exceljs',
-  'exceljs/*',
-  'earcut',
-  'emf-converter',
-  'opentype.js',
-  'loglevel',
   'node:*',
 ];
 

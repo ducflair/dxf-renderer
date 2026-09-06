@@ -142,6 +142,9 @@ Viewport.prototype.parseEntity = function (scanner, curr) {
         case 12:
             entity.viewCenter.x = curr.value;
             break;
+        case 17:
+            entity.viewTarget = helpers.parsePoint(scanner);
+            break;
         case 22:
             entity.viewCenter.y = curr.value;
             break;

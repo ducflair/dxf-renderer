@@ -16,7 +16,11 @@ const State = Object.freeze({
     PARAGRAPH2: 4,
     PARAGRAPH3: 5,
     /* Parsing \Cxxx color code. */
-    COLOR: 6
+    COLOR: 6,
+    FONT_HEIGHT: 7,
+    TRACKING: 8,
+    WIDTH_FACTOR: 9,
+    FONT_NAME: 10
 });
 
 export const MTextEntityType = Object.freeze({
@@ -29,7 +33,12 @@ export const MTextEntityType = Object.freeze({
      */
     PARAGRAPH_ALIGNMENT: 4,
     /** \Cxxx color code. "color" property specified (index resolved to actual color value). */
-    COLOR: 5
+    COLOR: 5,
+    FONT_HEIGHT: 6,
+    TRACKING: 7,
+    WIDTH_FACTOR: 8,
+    FONT_NAME: 9,
+    TAB: 10
     /* Many others are not yet implemented. */
 });
 
@@ -38,6 +47,11 @@ export type MTextFormatEntity = {
     content?: any;
     color?: number;
     alignment?: string;
+    factor?: number;
+    height?: number;
+    tracking?: number;
+    widthFactor?: number;
+    fontName?: string;
 };
 
 /** Single letter format codes which are not terminated by ";". */
@@ -63,6 +77,7 @@ export class MTextFormatParser {
     }
 
     Parse(text: string): void {
+        text = text.replace(/\^J|\r\n|\n|\u2028|\u2029/g, "\\P");
         const n = text.length;
         let textStart = 0;
         let state: number = State.TEXT;
@@ -127,6 +142,15 @@ export class MTextFormatParser {
 
             switch (state) {
             case State.TEXT:
+                if (c === "\t" || (c === "^" && text.charAt(curPos + 1).toUpperCase() === "I")) {
+                    EmitText();
+                    EmitEntity(MTextEntityType.TAB);
+                    if (c === "^") {
+                        curPos++;
+                    }
+                    textStart = curPos + 1;
+                    continue;
+                }
                 if (c === "{") {
                     EmitText();
                     PushScope();
@@ -169,6 +193,23 @@ export class MTextFormatParser {
                         state = State.COLOR;
                         textStart = curPos + 1;
                         continue;
+                    case "H":
+                        state = State.FONT_HEIGHT;
+                        textStart = curPos + 1;
+                        continue;
+                    case "T":
+                        state = State.TRACKING;
+                        textStart = curPos + 1;
+                        continue;
+                    case "W":
+                        state = State.WIDTH_FACTOR;
+                        textStart = curPos + 1;
+                        continue;
+                    case "f":
+                    case "F":
+                        state = State.FONT_NAME;
+                        textStart = curPos + 1;
+                        continue;
                     }
                     state = State.SKIP_FORMAT;
                     continue;
@@ -207,6 +248,66 @@ export class MTextFormatParser {
             case State.COLOR:
                 if (c === ";") {
                     EmitColor();
+                    textStart = curPos + 1;
+                    state = State.TEXT;
+                }
+                continue;
+
+            case State.FONT_HEIGHT:
+                if (c === ";") {
+                    const s = text.slice(textStart, curPos).trim();
+                    if (s.endsWith("x") || s.endsWith("X")) {
+                        const val = parseFloat(s.slice(0, -1));
+                        if (!isNaN(val) && val > 0) {
+                            curEntities.push({ type: MTextEntityType.FONT_HEIGHT, factor: val });
+                        }
+                    } else {
+                        const val = parseFloat(s);
+                        if (!isNaN(val) && val > 0) {
+                            curEntities.push({ type: MTextEntityType.FONT_HEIGHT, height: val });
+                        }
+                    }
+                    textStart = curPos + 1;
+                    state = State.TEXT;
+                }
+                continue;
+
+            case State.TRACKING:
+                if (c === ";") {
+                    let s = text.slice(textStart, curPos).trim();
+                    if (s.endsWith("x") || s.endsWith("X")) {
+                        s = s.slice(0, -1);
+                    }
+                    const val = parseFloat(s);
+                    if (!isNaN(val) && val > 0) {
+                        curEntities.push({ type: MTextEntityType.TRACKING, tracking: val });
+                    }
+                    textStart = curPos + 1;
+                    state = State.TEXT;
+                }
+                continue;
+
+            case State.WIDTH_FACTOR:
+                if (c === ";") {
+                    const s = text.slice(textStart, curPos).trim();
+                    const val = parseFloat(s);
+                    if (!isNaN(val) && val > 0) {
+                        curEntities.push({ type: MTextEntityType.WIDTH_FACTOR, widthFactor: val });
+                    }
+                    textStart = curPos + 1;
+                    state = State.TEXT;
+                }
+                continue;
+
+            case State.FONT_NAME:
+                if (c === ";") {
+                    const s = text.slice(textStart, curPos).trim();
+                    const [family, ...flags] = s.split("|");
+                    const suffix = [flags.includes("b1") ? "Bold" : "", flags.includes("i1") ? "Italic" : ""].filter(Boolean).join(" ");
+                    const fontName = suffix ? `${family} ${suffix}` : family;
+                    if (fontName) {
+                        curEntities.push({ type: MTextEntityType.FONT_NAME, fontName });
+                    }
                     textStart = curPos + 1;
                     state = State.TEXT;
                 }

@@ -6,7 +6,7 @@ const DEFAULT_COLUMN_WIDTH = 8.43;
 const DEFAULT_ROW_HEIGHT = 15;
 const EXCEL_COLUMN_PIXEL_WIDTH = 7;
 const POINT_TO_PIXEL = 96 / 72;
-const TARGET_SCALE = 2;
+const TARGET_SCALE = 4;
 const MAX_CANVAS_DIMENSION = 4096;
 const THEME_COLORS = [
     "#ffffff", "#000000", "#eeeCE1", "#1f497d", "#4f81bd", "#c0504d",
@@ -68,10 +68,10 @@ function GetBorderWidth(style?: string): number {
     case "medium":
     case "mediumDashed":
     case "mediumDashDot":
-    case "mediumDashDotDot": return 1.5;
-    case "thick": return 2.25;
-    case "double": return 1;
-    default: return 0.75;
+    case "mediumDashDotDot": return 2;
+    case "thick": return 3;
+    case "double": return 1.25;
+    default: return 1;
     }
 }
 

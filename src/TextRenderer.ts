@@ -1,7 +1,7 @@
 import { Entity } from "./DxfScene.js";
 import { Matrix3, Vector2, ShapePath, ShapeUtils } from "three";
 import { MTextFormatParser, type MTextFormatEntity } from "./MTextFormatParser.js";
-import type { FontFetcher, TextRendererOptions } from "./types.js";
+import { type FontFetcher, type TextRendererOptions, DefaultTextRendererOptions } from "./types.js";
 
 /** Regex for parsing special characters in text entities. */
 const SPECIAL_CHARS_RE = /(?:%%([dpcou%]))|(?:\\U\+([0-9a-f]{4}))/gi;
@@ -227,9 +227,9 @@ export class CharShape {
     }
 
     /** Get vertices array transformed to the specified position and with the specified size. */
-    GetVertices(position: { x: number; y: number }, size: number): Vector2[] | null {
+    GetVertices(position: { x: number; y: number }, size: number, widthFactor: number = 1): Vector2[] | null {
         if (!this.vertices) return null;
-        return this.vertices.map(v => v.clone().multiplyScalar(size).add(position as any));
+        return this.vertices.map(v => new Vector2(v.x * size * widthFactor + position.x, v.y * size + position.y));
     }
 }
 
@@ -237,15 +237,19 @@ export class CharShape {
 class TextBlock {
     fontSize: number;
     color?: number | null;
+    tracking: number;
+    widthFactor: number;
     glyphs: { shape: CharShape; vertices: Vector2[] | null }[];
     bounds: { xMin: number; xMax: number; yMin: number; yMax: number } | null;
     curX: number;
     prevChar: string | null;
     prevFont: Font | null;
 
-    constructor(fontSize: number, color?: number | null) {
+    constructor(fontSize: number, color?: number | null, tracking: number = 1, widthFactor: number = 1) {
         this.fontSize = fontSize;
         this.color = color;
+        this.tracking = tracking;
+        this.widthFactor = widthFactor;
         this.glyphs = [];
         this.bounds = null;
         this.curX = 0;
@@ -260,12 +264,12 @@ class TextBlock {
         } else {
             offset = 0;
         }
-        const x = this.curX + offset * this.fontSize;
+        const x = this.curX + offset * this.fontSize * this.widthFactor;
         let vertices: Vector2[] | null;
         if (shape.vertices && shape.vertices.length > 0) {
-            vertices = shape.GetVertices({ x, y: 0 }, this.fontSize);
-            const xMin = x + shape.bounds.xMin * this.fontSize;
-            const xMax = x + shape.bounds.xMax * this.fontSize;
+            vertices = shape.GetVertices({ x, y: 0 }, this.fontSize, this.widthFactor);
+            const xMin = x + shape.bounds.xMin * this.fontSize * this.widthFactor;
+            const xMax = x + shape.bounds.xMax * this.fontSize * this.widthFactor;
             const yMin = shape.bounds.yMin * this.fontSize;
             const yMax = shape.bounds.yMax * this.fontSize;
             if (this.bounds === null) {
@@ -287,7 +291,7 @@ class TextBlock {
         } else {
             vertices = null;
         }
-        this.curX = x + shape.advance * this.fontSize;
+        this.curX = x + shape.advance * this.fontSize * this.widthFactor * this.tracking;
         this.glyphs.push({ shape, vertices });
         this.prevChar = char;
         this.prevFont = shape.font;
@@ -401,23 +405,45 @@ class TextBlock {
     }
 }
 
+type TextStyle = {
+    fontName?: string | null;
+    fontSize: number;
+    color: number | null;
+    tracking: number;
+    widthFactor: number;
+    alignment: number | null;
+};
+
 class TextBoxChunk {
     paragraph: TextBoxParagraph;
     fontSize: number;
     color: number | null;
+    tracking: number;
+    widthFactor: number;
     prevChunk: TextBoxChunk | null;
     lastChar: string | null = null;
     lastShape: CharShape | null = null;
     leadingSpaces: number = 0;
+    leadingTabs: number = 0;
     spaceStartKerning: number | null = null;
     spaceEndKerning: number | null = null;
     block: TextBlock | null = null;
     position: number = 0;
+    spacingWidth: number = 0;
 
-    constructor(paragraph: TextBoxParagraph, fontSize: number, color: number | null, prevChunk: TextBoxChunk | null) {
+    constructor(
+        paragraph: TextBoxParagraph,
+        fontSize: number,
+        color: number | null,
+        tracking: number = 1,
+        widthFactor: number = 1,
+        prevChunk: TextBoxChunk | null = null
+    ) {
         this.paragraph = paragraph;
         this.fontSize = fontSize;
         this.color = color;
+        this.tracking = tracking;
+        this.widthFactor = widthFactor;
         this.prevChunk = prevChunk;
     }
 
@@ -428,9 +454,16 @@ class TextBoxChunk {
         this.leadingSpaces++;
     }
 
+    PushTab(): void {
+        if (this.block) {
+            throw new Error("Illegal operation");
+        }
+        this.leadingTabs++;
+    }
+
     PushChar(char: string, shape: CharShape): void {
         if (this.spaceStartKerning === null) {
-            if (this.leadingSpaces === 0) {
+            if (this.leadingSpaces === 0 && this.leadingTabs === 0) {
                 this.spaceStartKerning = 0;
                 this.spaceEndKerning = 0;
             } else {
@@ -452,7 +485,7 @@ class TextBoxChunk {
         }
 
         if (this.block === null) {
-            this.block = new TextBlock(this.fontSize, this.color);
+            this.block = new TextBlock(this.fontSize, this.color, this.tracking, this.widthFactor);
         }
         this.block.PushChar(char, shape);
 
@@ -460,19 +493,26 @@ class TextBoxChunk {
         this.lastShape = shape;
     }
 
-    GetSpacingWidth(): number {
-        const advance = this.paragraph.textBox.spaceShape?.advance ?? 0;
-        return (this.leadingSpaces * advance +
+    GetSpacingWidth(linePosition: number = 0): number {
+        let tabSpacing = 0;
+        const tabWidth = 4 * this.fontSize * this.widthFactor;
+        for (let i = 0; i < this.leadingTabs; i++) {
+            const position = linePosition + tabSpacing;
+            const remainder = ((position % tabWidth) + tabWidth) % tabWidth;
+            tabSpacing += remainder < 1e-9 ? tabWidth : tabWidth - remainder;
+        }
+        const advance = (this.paragraph.textBox.spaceShape?.advance ?? 0) * this.widthFactor * this.tracking;
+        return tabSpacing + (this.leadingSpaces * advance +
             (this.spaceStartKerning ?? 0) + (this.spaceEndKerning ?? 0)) * this.fontSize;
     }
 
-    GetWidth(withSpacing: boolean): number {
+    GetWidth(withSpacing: boolean, linePosition: number = 0): number {
         if (this.block === null) {
             return 0;
         }
         let width = this.block.GetCurrentPosition();
         if (withSpacing) {
-            width += this.GetSpacingWidth();
+            width += this.GetSpacingWidth(linePosition);
         }
         return width;
     }
@@ -483,12 +523,20 @@ class TextBoxLine {
     startChunkIdx: number;
     numChunks: number;
     width: number;
+    maxFontSize: number;
 
-    constructor(paragraph: TextBoxParagraph, startChunkIdx: number, numChunks: number, width: number) {
+    constructor(
+        paragraph: TextBoxParagraph,
+        startChunkIdx: number,
+        numChunks: number,
+        width: number,
+        maxFontSize: number
+    ) {
         this.paragraph = paragraph;
         this.startChunkIdx = startChunkIdx;
         this.numChunks = numChunks;
         this.width = width;
+        this.maxFontSize = maxFontSize;
     }
 
     ApplyAlignment(boxWidth: number, defaultAlignment: number): void {
@@ -547,6 +595,7 @@ class TextBoxParagraph {
     alignment: number | null;
     lines: TextBoxLine[] | null;
     color: number | null;
+    currentStyle: TextStyle;
 
     constructor(textBox: TextBox) {
         this.textBox = textBox;
@@ -555,10 +604,17 @@ class TextBoxParagraph {
         this.alignment = null;
         this.lines = null;
         this.color = null;
+        this.currentStyle = {
+            fontSize: textBox.fontSize,
+            color: null,
+            tracking: 1,
+            widthFactor: 1,
+            alignment: null
+        };
     }
 
     FeedChar(c: string): void {
-        const shape = this.textBox.charShapeProvider(c);
+        const shape = this.textBox.charShapeProvider(c, this.currentStyle.fontName);
         if (shape === null) {
             return;
         }
@@ -575,48 +631,87 @@ class TextBoxParagraph {
         this.curChunk!.PushSpace();
     }
 
+    FeedTab(): void {
+        if (this.curChunk === null || this.curChunk.lastChar !== null) {
+            this._AddChunk();
+        }
+        this.curChunk!.PushTab();
+    }
+
     SetAlignment(alignment: number | null): void {
         this.alignment = alignment;
     }
 
     SetColor(color: number | null): void {
         this.color = color;
+        this.currentStyle.color = color;
+    }
+
+    ApplyStyle(style: TextStyle): void {
+        this.currentStyle = { ...style };
+        if (this.curChunk !== null) {
+            if (this.curChunk.block !== null || this.curChunk.leadingSpaces > 0 || this.curChunk.leadingTabs > 0) {
+                if (this.curChunk.fontSize !== style.fontSize ||
+                    this.curChunk.color !== style.color ||
+                    this.curChunk.tracking !== style.tracking ||
+                    this.curChunk.widthFactor !== style.widthFactor) {
+                    this.curChunk = null;
+                }
+            } else {
+                this.curChunk.fontSize = style.fontSize;
+                this.curChunk.color = style.color;
+                this.curChunk.tracking = style.tracking;
+                this.curChunk.widthFactor = style.widthFactor;
+            }
+        }
     }
 
     BuildLines(boxWidth: number | null): void {
-        if (this.curChunk === null) {
+        if (this.chunks.length === 0) {
             return;
         }
         this.lines = [];
         let startChunkIdx = 0;
         let curChunkIdx = 0;
         let curWidth = 0;
+        let curMaxFontSize = this.chunks[0]?.fontSize ?? this.currentStyle?.fontSize ?? this.textBox.fontSize;
 
         const CommitLine = () => {
-            this.lines!.push(new TextBoxLine(this, startChunkIdx, curChunkIdx - startChunkIdx, curWidth));
+            this.lines!.push(new TextBoxLine(this, startChunkIdx, curChunkIdx - startChunkIdx, curWidth, curMaxFontSize));
             startChunkIdx = curChunkIdx;
             curWidth = 0;
+            curMaxFontSize = this.chunks[curChunkIdx]?.fontSize ?? this.currentStyle?.fontSize ?? this.textBox.fontSize;
         };
 
         for (; curChunkIdx < this.chunks.length; curChunkIdx++) {
             const chunk = this.chunks[curChunkIdx];
-            let chunkWidth = chunk.GetWidth(startChunkIdx === 0 || curChunkIdx !== startChunkIdx);
+            if (chunk.fontSize > curMaxFontSize) {
+                curMaxFontSize = chunk.fontSize;
+            }
+            const contentWidth = chunk.GetWidth(false);
+            const includeSpacing = startChunkIdx === 0 || curChunkIdx !== startChunkIdx;
+            chunk.spacingWidth = includeSpacing ? chunk.GetSpacingWidth(curWidth) : 0;
+            let chunkWidth = contentWidth + chunk.spacingWidth;
             if (boxWidth !== null && boxWidth !== 0) {
                 if (curWidth + chunkWidth > boxWidth) {
-                    if (curChunkIdx === 0 && chunk.leadingSpaces > 0) {
-                        this.lines.push(new TextBoxLine(this, startChunkIdx, startChunkIdx, 0));
+                    if (curChunkIdx === 0 && (chunk.leadingSpaces > 0 || chunk.leadingTabs > 0)) {
+                        this.lines.push(new TextBoxLine(this, startChunkIdx, startChunkIdx, 0, curMaxFontSize));
                         chunk.leadingSpaces = 0;
-                        chunkWidth = chunk.GetWidth(false);
+                        chunk.leadingTabs = 0;
+                        chunk.spacingWidth = 0;
+                        chunkWidth = contentWidth;
                     }
                     if (curWidth !== 0) {
                         CommitLine();
+                        chunk.spacingWidth = 0;
+                        chunkWidth = contentWidth;
                     }
                 }
             }
             chunk.position = curWidth;
             curWidth += chunkWidth;
         }
-        if (startChunkIdx !== curChunkIdx && curWidth !== 0) {
+        if (startChunkIdx !== curChunkIdx) {
             CommitLine();
         }
     }
@@ -643,7 +738,14 @@ class TextBoxParagraph {
     }
 
     _AddChunk(): void {
-        this.curChunk = new TextBoxChunk(this, this.textBox.fontSize, this.color, this.curChunk);
+        this.curChunk = new TextBoxChunk(
+            this,
+            this.currentStyle.fontSize,
+            this.currentStyle.color,
+            this.currentStyle.tracking,
+            this.currentStyle.widthFactor,
+            this.curChunk
+        );
         this.chunks.push(this.curChunk);
     }
 }
@@ -653,12 +755,12 @@ class TextBox {
     static Paragraph = TextBoxParagraph;
 
     fontSize: number;
-    charShapeProvider: (char: string) => CharShape | null;
+    charShapeProvider: (char: string, fontName?: string | null) => CharShape | null;
     curParagraph: TextBoxParagraph;
     paragraphs: TextBoxParagraph[];
     spaceShape: CharShape | null;
 
-    constructor(fontSize: number, charShapeProvider: (char: string) => CharShape | null) {
+    constructor(fontSize: number, charShapeProvider: (char: string, fontName?: string | null) => CharShape | null) {
         this.fontSize = fontSize;
         this.charShapeProvider = charShapeProvider;
         this.curParagraph = new TextBoxParagraph(this);
@@ -667,72 +769,118 @@ class TextBox {
     }
 
     FeedText(formattedText: MTextFormatEntity[]): void {
-        function* FlattenItems(items: MTextFormatEntity[]): Generator<MTextFormatEntity> {
+        const initialStyle: TextStyle = {
+            fontSize: this.fontSize,
+            color: null,
+            tracking: 1,
+            widthFactor: 1,
+            alignment: null
+        };
+        const styleStack: TextStyle[] = [];
+        let currentStyle: TextStyle = { ...initialStyle };
+
+        const applyStyle = () => {
+            this.curParagraph.ApplyStyle(currentStyle);
+        };
+
+        const processItems = (items: MTextFormatEntity[]) => {
             for (const item of items) {
-                if (item.type === MTextFormatParser.EntityType.SCOPE && Array.isArray(item.content)) {
-                    yield* FlattenItems(item.content);
-                } else {
-                    yield item;
-                }
-            }
-        }
-
-        let curAlignment: number | null = null;
-        let curColor: number | null = null;
-
-        for (const item of FlattenItems(formattedText)) {
-            switch (item.type) {
-            case MTextFormatParser.EntityType.TEXT:
-                for (const c of (item.content as string)) {
-                    if (c === " ") {
-                        this.curParagraph.FeedSpace();
-                    } else {
-                        this.curParagraph.FeedChar(c);
+                switch (item.type) {
+                case MTextFormatParser.EntityType.SCOPE:
+                    if (Array.isArray(item.content)) {
+                        styleStack.push({ ...currentStyle });
+                        processItems(item.content);
+                        currentStyle = styleStack.pop() ?? { ...initialStyle };
+                        applyStyle();
                     }
+                    break;
+
+                case MTextFormatParser.EntityType.TEXT:
+                    for (const c of (item.content as string)) {
+                        if (c === " ") {
+                            this.curParagraph.FeedSpace();
+                        } else {
+                            this.curParagraph.FeedChar(c);
+                        }
+                    }
+                    break;
+
+                case MTextFormatParser.EntityType.PARAGRAPH:
+                    this.curParagraph = new TextBoxParagraph(this);
+                    this.curParagraph.SetAlignment(currentStyle.alignment);
+                    this.curParagraph.ApplyStyle(currentStyle);
+                    this.paragraphs.push(this.curParagraph);
+                    break;
+
+                case MTextFormatParser.EntityType.NON_BREAKING_SPACE:
+                    this.curParagraph.FeedChar(" ");
+                    break;
+
+                case MTextFormatParser.EntityType.TAB:
+                    this.curParagraph.FeedTab();
+                    break;
+
+                case MTextFormatParser.EntityType.PARAGRAPH_ALIGNMENT: {
+                    let a: number | null = null;
+                    switch (item.alignment) {
+                    case "l":
+                        a = ParagraphAlignment.LEFT;
+                        break;
+                    case "c":
+                        a = ParagraphAlignment.CENTER;
+                        break;
+                    case "r":
+                        a = ParagraphAlignment.RIGHT;
+                        break;
+                    case "d":
+                        a = ParagraphAlignment.JUSTIFY;
+                        break;
+                    case "j":
+                        a = null;
+                        break;
+                    }
+                    currentStyle.alignment = a;
+                    this.curParagraph.SetAlignment(a);
+                    break;
                 }
-                break;
 
-            case MTextFormatParser.EntityType.PARAGRAPH:
-                this.curParagraph = new TextBoxParagraph(this);
-                this.curParagraph.SetAlignment(curAlignment);
-                this.curParagraph.SetColor(curColor);
-                this.paragraphs.push(this.curParagraph);
-                break;
+                case MTextFormatParser.EntityType.COLOR:
+                    currentStyle.color = item.color ?? null;
+                    applyStyle();
+                    break;
 
-            case MTextFormatParser.EntityType.NON_BREAKING_SPACE:
-                this.curParagraph.FeedChar(" ");
-                break;
+                case MTextFormatParser.EntityType.FONT_NAME:
+                    currentStyle.fontName = item.fontName;
+                    applyStyle();
+                    break;
 
-            case MTextFormatParser.EntityType.PARAGRAPH_ALIGNMENT: {
-                let a: number | null = null;
-                switch (item.alignment) {
-                case "l":
-                    a = ParagraphAlignment.LEFT;
+                case MTextFormatParser.EntityType.FONT_HEIGHT:
+                    if (item.factor !== undefined) {
+                        currentStyle.fontSize = currentStyle.fontSize * item.factor;
+                    } else if (item.height !== undefined) {
+                        currentStyle.fontSize = item.height;
+                    }
+                    applyStyle();
                     break;
-                case "c":
-                    a = ParagraphAlignment.CENTER;
+
+                case MTextFormatParser.EntityType.TRACKING:
+                    if (item.tracking !== undefined) {
+                        currentStyle.tracking = item.tracking;
+                    }
+                    applyStyle();
                     break;
-                case "r":
-                    a = ParagraphAlignment.RIGHT;
-                    break;
-                case "d":
-                    a = ParagraphAlignment.JUSTIFY;
-                    break;
-                case "j":
-                    a = null;
+
+                case MTextFormatParser.EntityType.WIDTH_FACTOR:
+                    if (item.widthFactor !== undefined) {
+                        currentStyle.widthFactor = item.widthFactor;
+                    }
+                    applyStyle();
                     break;
                 }
-                this.curParagraph.SetAlignment(a);
-                curAlignment = a;
-                break;
             }
+        };
 
-            case MTextFormatParser.EntityType.COLOR:
-                curColor = item.color ?? null;
-                this.curParagraph.SetColor(curColor);
-                break;
-            }
-        }
+        processItems(formattedText);
     }
 
     *Render(
@@ -745,11 +893,18 @@ class TextBox {
         color?: number | null,
         layer: string | null = null
     ): Generator<Entity> {
-        for (const p of this.paragraphs) {
-            p.BuildLines(width);
+        let effectiveBoxWidth = width ?? null;
+        if (effectiveBoxWidth !== null && effectiveBoxWidth !== undefined) {
+            if (effectiveBoxWidth <= 0 || effectiveBoxWidth <= this.fontSize) {
+                effectiveBoxWidth = null;
+            }
         }
-        let boxWidth = width;
-        if (boxWidth === null || boxWidth === 0) {
+
+        for (const p of this.paragraphs) {
+            p.BuildLines(effectiveBoxWidth);
+        }
+        let boxWidth = effectiveBoxWidth;
+        if (boxWidth === null) {
             boxWidth = 0;
             for (const p of this.paragraphs) {
                 const pWidth = p.GetMaxLineWidth();
@@ -784,17 +939,25 @@ class TextBox {
             rot = Math.atan2(direction.y, direction.x) * 180 / Math.PI;
         }
 
-        const lineHeight = lineSpacing * 5 * this.fontSize / 3;
+        const lineSpacingFactor = lineSpacing ?? 1;
 
-        let height = 0;
+        let totalHeight = 0;
+        let lineCount = 0;
+        let firstLineMaxFontSize = this.fontSize;
         for (const p of this.paragraphs) {
-            if (p.lines === null) {
-                height++;
+            if (p.lines === null || p.lines.length === 0) {
+                totalHeight += lineSpacingFactor * 5 * p.currentStyle.fontSize / 3;
+                lineCount++;
             } else {
-                height += p.lines.length;
+                for (const line of p.lines) {
+                    if (lineCount === 0) {
+                        firstLineMaxFontSize = line.maxFontSize;
+                    }
+                    totalHeight += lineSpacingFactor * 5 * line.maxFontSize / 3;
+                    lineCount++;
+                }
             }
         }
-        height *= lineHeight;
 
         let origin = new Vector2();
         switch (effectiveAttachment) {
@@ -807,26 +970,26 @@ class TextBox {
             origin.x = boxWidth;
             break;
         case MTextAttachment.MIDDLE_LEFT:
-            origin.y = -height / 2;
+            origin.y = -totalHeight / 2;
             break;
         case MTextAttachment.MIDDLE_CENTER:
             origin.x = boxWidth / 2;
-            origin.y = -height / 2;
+            origin.y = -totalHeight / 2;
             break;
         case MTextAttachment.MIDDLE_RIGHT:
             origin.x = boxWidth;
-            origin.y = -height / 2;
+            origin.y = -totalHeight / 2;
             break;
         case MTextAttachment.BOTTOM_LEFT:
-            origin.y = -height;
+            origin.y = -totalHeight;
             break;
         case MTextAttachment.BOTTOM_CENTER:
             origin.x = boxWidth / 2;
-            origin.y = -height;
+            origin.y = -totalHeight;
             break;
         case MTextAttachment.BOTTOM_RIGHT:
             origin.x = boxWidth;
-            origin.y = -height;
+            origin.y = -totalHeight;
             break;
         default:
             break;
@@ -835,10 +998,10 @@ class TextBox {
         const transform = new Matrix3().translate(-origin.x, -origin.y)
             .rotate(-rot * Math.PI / 180).translate(position.x, position.y);
 
-        let y = -this.fontSize;
+        let y = -firstLineMaxFontSize;
         for (const p of this.paragraphs) {
-            if (p.lines === null) {
-                y -= lineHeight;
+            if (p.lines === null || p.lines.length === 0) {
+                y -= lineSpacingFactor * 5 * p.currentStyle.fontSize / 3;
                 continue;
             }
             for (const line of p.lines) {
@@ -849,7 +1012,7 @@ class TextBox {
                     const chunk = p.chunks[chunkIdx];
                     let x = chunk.position;
                     if (chunkIdx === 0 || chunkIdx !== line.startChunkIdx) {
-                        x += chunk.GetSpacingWidth();
+                        x += chunk.spacingWidth;
                     }
                     const v = new Vector2(x, y);
                     v.applyMatrix3(transform);
@@ -859,7 +1022,8 @@ class TextBox {
                                                   color, layer);
                     }
                 }
-                y -= lineHeight;
+                const lineH = lineSpacingFactor * 5 * line.maxFontSize / 3;
+                y -= lineH;
             }
         }
     }
@@ -869,10 +1033,7 @@ class TextBox {
  * Helper class for rendering text.
  */
 export class TextRenderer {
-    static DefaultOptions: Required<TextRendererOptions> = {
-        curveSubdivision: 2,
-        fallbackChar: "\uFFFD?"
-    };
+    static DefaultOptions: Required<TextRendererOptions> = DefaultTextRendererOptions;
 
     fontFetchers: FontFetcher[];
     fonts: Font[];
@@ -1008,7 +1169,7 @@ export class TextRenderer {
         fontName?: string | null;
     }): Generator<Entity> {
         const effectiveFontSize = fontSize || 1;
-        const box = new TextBox(effectiveFontSize, char => this._GetCharShape(char, fontName));
+        const box = new TextBox(effectiveFontSize, (char, inlineFont) => this._GetCharShape(char, inlineFont ?? fontName));
         box.FeedText(formattedText);
         yield* box.Render(position, width, rotation ?? 0, direction, attachment, lineSpacing ?? 1, color, layer);
     }
