@@ -248,10 +248,18 @@ export class DxfWorker {
             const layerNamesByHandle = new Map(Object.values(dxf.tables?.layer?.layers || {})
                 .filter((layer: any) => layer.handle)
                 .map((layer: any) => [layer.handle, layer.name]));
-            dxfScene.scene.viewports = (dxf.entities as any[]).filter(entity =>
+            const layoutBlock = Object.values(dxf.blocks || {}).find((b: any) =>
+                (activeLayout.blockRecordHandle && b.ownerHandle === activeLayout.blockRecordHandle) ||
+                (b.name && b.name.toLowerCase() === "*paper_space" && (!activeLayout.blockRecordHandle || (dxf.layouts || []).length <= 2))
+            ) as any;
+            const candidateEntities = [
+                ...((dxf.entities as any[]) || []),
+                ...((layoutBlock?.entities as any[]) || []).map((e: any) => ({ ...e, inPaperSpace: true }))
+            ];
+            dxfScene.scene.viewports = candidateEntities.filter(entity =>
                 entity.type === "VIEWPORT" &&
                 entity.inPaperSpace &&
-                entity.ownerHandle === activeLayout.blockRecordHandle &&
+                (!activeLayout.blockRecordHandle || !entity.ownerHandle || entity.ownerHandle === activeLayout.blockRecordHandle || (layoutBlock?.handle && entity.ownerHandle === layoutBlock.handle)) &&
                 (entity.viewportId ?? 0) > 1 &&
                 (entity.status ?? 0) > 0 &&
                 (entity.width ?? 0) > 0 &&

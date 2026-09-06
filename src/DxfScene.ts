@@ -9,7 +9,8 @@ import { LinearDimension } from "./LinearDimension.js"
 import { HatchCalculator, HatchStyle } from "./HatchCalculator.js"
 import { LookupPattern, Pattern } from "./Pattern.js"
 import "./patterns/index.js"
-import earcut from "earcut"
+import {triangulateSolidHatch} from "./SolidHatch.js"
+import { DefaultTextRendererOptions } from "./types.js"
 
 
 /** Use 16-bit indices for indexed geometry. */
@@ -96,6 +97,7 @@ export class DxfScene {
     layouts: any;
     activeLayout: any;
     activeLayoutInfo: any;
+    activeLayoutBlock: any;
     textRenderer: any;
     hasMissingChars: boolean = false;
     pointShapeHasDot: boolean = false;
@@ -180,21 +182,62 @@ export class DxfScene {
 
         if (dxf.blocks) {
             for (const [, block] of Object.entries(dxf.blocks as any) as [string, any][]) {
+                const name = block.name?.toLowerCase() ?? ""
+                if (name.startsWith("*paper_space") || name.startsWith("*model_space")) {
+                    continue
+                }
                 this.blocks.set(block.name, new Block(block))
             }
         }
 
         this.imageDefs = dxf.imageDefs || {}
         this.layouts = dxf.layouts || []
-        this.activeLayout = this.options.layout || (this.layouts.find(l => !l.isModel)?.name ?? "Model")
+        this.activeLayout = this.options.layout || (this.options.suppressPaperSpace ? "Model" :
+            (this.layouts.find(l => !l.isModel)?.name ?? "Model"))
         this.activeLayoutInfo = this.layouts.find(l => l.name === this.activeLayout) ?? null
+
+        this.activeLayoutBlock = null
+        if (!this.activeLayoutInfo?.isModel && this.activeLayout !== "Model") {
+            const blockRecordHandle = this.activeLayoutInfo?.blockRecordHandle
+            if (dxf.blocks) {
+                this.activeLayoutBlock = Object.values(dxf.blocks as any).find((b: any) =>
+                    (blockRecordHandle && b.ownerHandle === blockRecordHandle) ||
+                    (b.name && b.name.toLowerCase() === "*paper_space" && (!blockRecordHandle || this.layouts.length <= 2))
+                ) ?? null
+            }
+        }
+
+        const isModel = this.activeLayoutInfo?.isModel ?? this.activeLayout === "Model"
+        const layoutEntities: any[] = []
+        if (isModel) {
+            for (const entity of dxf.entities) {
+                if (!entity.inPaperSpace) {
+                    layoutEntities.push(entity)
+                }
+            }
+        } else {
+            const ownerHandle = this.activeLayoutInfo?.blockRecordHandle
+            const layoutBlockHandle = this.activeLayoutBlock?.handle
+            for (const entity of dxf.entities) {
+                if (entity.inPaperSpace) {
+                    if (!ownerHandle || !entity.ownerHandle || entity.ownerHandle === ownerHandle || (layoutBlockHandle && entity.ownerHandle === layoutBlockHandle)) {
+                        layoutEntities.push(entity)
+                    }
+                }
+            }
+            if (this.activeLayoutBlock?.entities) {
+                for (const entity of this.activeLayoutBlock.entities) {
+                    layoutEntities.push({ ...entity, inPaperSpace: true })
+                }
+            }
+        }
 
         this.textRenderer = new TextRenderer(fontFetchers, this.options.textOptions)
         this.hasMissingChars = false
-        await this._FetchFonts(dxf)
+        await this._FetchFonts(dxf, layoutEntities)
 
         /* Scan all entities to analyze block usage statistics. */
-        for (const entity of dxf.entities) {
+        for (const entity of layoutEntities) {
             if (!this._FilterEntity(entity)) {
                 continue
             }
@@ -227,7 +270,7 @@ export class DxfScene {
         }
         console.log(`${this.numBlocksFlattened} blocks flattened`)
 
-        for (const entity of dxf.entities) {
+        for (const entity of layoutEntities) {
             if (!this._FilterEntity(entity)) {
                 this.numEntitiesFiltered++
                 continue
@@ -236,6 +279,12 @@ export class DxfScene {
         }
         console.log(`${this.numEntitiesFiltered} entities filtered`)
 
+        // A sheet's framing comes from paper limits, including viewports on non-plot layers.
+        const limits = this.activeLayoutInfo?.paperLimits
+        if (!isModel && limits && limits.maxX > limits.minX && limits.maxY > limits.minY) {
+            this.bounds = {...limits}
+            this.origin ??= {x: limits.minX, y: limits.minY}
+        }
         this.scene = this._BuildScene()
 
         delete this.batches
@@ -266,10 +315,11 @@ export class DxfScene {
             return false
         }
         const ownerHandle = this.activeLayoutInfo?.blockRecordHandle
-        return !ownerHandle || !entity.ownerHandle || entity.ownerHandle === ownerHandle
+        const layoutBlockHandle = this.activeLayoutBlock?.handle
+        return !ownerHandle || !entity.ownerHandle || entity.ownerHandle === ownerHandle || (layoutBlockHandle && entity.ownerHandle === layoutBlockHandle)
     }
 
-    async _FetchFonts(dxf) {
+    async _FetchFonts(dxf, layoutEntities = dxf.entities) {
 
         function IsTextEntity(entity) {
             return entity.type === "TEXT" || entity.type === "MTEXT" ||
@@ -291,7 +341,13 @@ export class DxfScene {
                 const parser = new MTextFormatParser()
                 parser.Parse(entity.text)
                 ret = true
-                //XXX formatted MTEXT may specify some fonts explicitly, this is not yet supported
+                const fetchInlineFonts = async (items) => {
+                    for (const item of items) {
+                        if (item.fontName) await this.textRenderer.FetchFonts(" ", item.fontName)
+                        if (Array.isArray(item.content)) await fetchInlineFonts(item.content)
+                    }
+                }
+                await fetchInlineFonts(parser.GetContent())
                 for (const text of parser.GetText()) {
                     if (!await this.textRenderer.FetchFonts(ParseSpecialChars(text), fontName)) {
                         ret = false
@@ -320,7 +376,7 @@ export class DxfScene {
             return ret
         }
 
-        for (const entity of dxf.entities) {
+        for (const entity of layoutEntities) {
             if (IsTextEntity(entity)) {
                 if (!await ProcessEntity(entity)) {
                     /* Failing to resolve some character means that all fonts have been loaded and
@@ -1283,17 +1339,12 @@ export class DxfScene {
         }
 
         if (entity.isSolid) {
-            const coords = this._TransformBoundaryLoop(filteredBoundaryLoops[0], transform)
-            const holes = []
-            for (let i = 1; i < filteredBoundaryLoops.length; i++) {
-                holes.push(coords.length / 2)
-                this._TransformBoundaryLoop(filteredBoundaryLoops[i], transform, coords)
-            }
-            const indices = earcut(coords, holes)
-            const vertices = []
-            for (const loop of filteredBoundaryLoops) {
-                vertices.push(...loop)
-            }
+            const loops = boundaryLoops.map(loop => loop.vertices.map(vertex => {
+                const point = vertex.clone()
+                if (transform) point.applyMatrix3(transform)
+                return point
+            }))
+            const {vertices, indices} = triangulateSolidHatch(loops, style)
             yield new Entity({
                 type: Entity.Type.TRIANGLES,
                 vertices, indices, layer, color
@@ -3073,7 +3124,7 @@ DxfScene.DefaultOptions = {
     /** Suppress entities on layers marked as non-plotting. */
     suppressNonPlotLayers: true,
     /** Text rendering options. */
-    textOptions: TextRenderer.DefaultOptions,
+    textOptions: DefaultTextRendererOptions,
 }
 
 function DecodeBinaryChunks(chunks) {

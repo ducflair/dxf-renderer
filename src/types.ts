@@ -6,6 +6,11 @@ export type TextRendererOptions = {
     fallbackChar?: string;
 };
 
+export const DefaultTextRendererOptions: Required<TextRendererOptions> = {
+    curveSubdivision: 2,
+    fallbackChar: "\uFFFD?"
+};
+
 /** See DxfScene.DefaultOptions for default values and documentation. */
 export type DxfSceneOptions = {
     arcTessellationAngle?: number;

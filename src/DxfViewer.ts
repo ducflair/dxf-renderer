@@ -852,9 +852,12 @@ export class DxfViewer {
         camera.right = modelLeft + modelWidth * horizontalEnd
         camera.bottom = modelBottom + modelHeight * verticalStart
         camera.top = modelBottom + modelHeight * verticalEnd
+        const twist = -(viewport.viewTwistAngle || 0) * Math.PI / 180
+        const viewCenter = new three.Vector2(viewport.viewCenter.x, viewport.viewCenter.y)
+            .rotateAround(new three.Vector2(), twist)
         camera.position.set(
-            viewport.viewCenter.x - this.modelOrigin.x,
-            viewport.viewCenter.y - this.modelOrigin.y,
+            viewCenter.x + (viewport.viewTarget?.x ?? 0) - this.modelOrigin.x,
+            viewCenter.y + (viewport.viewTarget?.y ?? 0) - this.modelOrigin.y,
             1)
         camera.rotation.set(0, 0, -(viewport.viewTwistAngle || 0) * Math.PI / 180)
         camera.updateProjectionMatrix()
